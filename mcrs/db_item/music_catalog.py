@@ -4,11 +4,33 @@ Supported metadata fields:
     track_id, ISRC, track_name, artist_name, album_name,
     tag_list, popularity, release_date, duration, artist_id, album_id
 """
+import logging
 import os
 import json
 from typing import Dict, List, Optional, Any
 
 from datasets import load_dataset, concatenate_datasets
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_splits(ds, requested: List[str], dataset_name: str) -> List[str]:
+    """Return valid splits from ``requested``, falling back to all splits if needed."""
+    avail = list(ds.keys())
+    valid = [s for s in requested if s in avail]
+    if not valid:
+        logger.warning(
+            "None of the requested splits %s found in '%s' (available: %s). "
+            "Falling back to all available splits.",
+            requested, dataset_name, avail,
+        )
+        return avail
+    skipped = [s for s in requested if s not in avail]
+    if skipped:
+        logger.warning(
+            "Splits not found in '%s', skipping: %s", dataset_name, skipped
+        )
+    return valid
 
 
 # All 11 metadata fields required by the task
@@ -58,8 +80,9 @@ class MusicCatalogDB:
         """
         self.corpus_types = corpus_types or DEFAULT_CORPUS_TYPES
         metadata_dataset = load_dataset(dataset_name)
+        valid_splits = _resolve_splits(metadata_dataset, split_types, dataset_name)
         metadata_concat_dataset = concatenate_datasets(
-            [metadata_dataset[split_type] for split_type in split_types]
+            [metadata_dataset[s] for s in valid_splits]
         )
         # Store the full row; missing columns will be absent from the dict
         self.metadata_dict: Dict[str, Dict[str, Any]] = {

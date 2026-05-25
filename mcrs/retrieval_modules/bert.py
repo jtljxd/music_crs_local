@@ -82,7 +82,9 @@ class BERT_MODEL:
             A mapping from `track_id` to its metadata dictionary.
         """
         metadata_dataset = load_dataset(self.dataset_name)
-        metadata_concat_dataset = concatenate_datasets([metadata_dataset[split_type] for split_type in self.split_types])
+        avail_splits = list(metadata_dataset.keys())
+        valid_splits = [s for s in self.split_types if s in avail_splits] or avail_splits
+        metadata_concat_dataset = concatenate_datasets([metadata_dataset[s] for s in valid_splits])
         metadata_dict = {item["track_id"]: item for item in metadata_concat_dataset}
         return metadata_dict
 

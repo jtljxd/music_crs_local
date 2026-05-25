@@ -154,7 +154,26 @@ class _EmbeddingStore:
         self.cols: List[str] = []      # columns that exist in the dataset
 
         ds = load_dataset(dataset_name)
-        combined = concatenate_datasets([ds[s] for s in split_types])
+        avail_splits = list(ds.keys())
+
+        # Resolve which splits to actually load:
+        # use requested split_types that exist; fall back to ALL available splits.
+        valid_splits = [s for s in split_types if s in avail_splits]
+        if not valid_splits:
+            logger.warning(
+                "None of the requested splits %s found in '%s' (available: %s). "
+                "Falling back to all available splits: %s",
+                split_types, dataset_name, avail_splits, avail_splits,
+            )
+            valid_splits = avail_splits
+        elif len(valid_splits) < len(split_types):
+            skipped = [s for s in split_types if s not in avail_splits]
+            logger.warning(
+                "Splits not found in '%s', skipping: %s (available: %s)",
+                dataset_name, skipped, avail_splits,
+            )
+
+        combined = concatenate_datasets([ds[s] for s in valid_splits])
         avail_cols = combined.column_names
         logger.info(
             "Dataset '%s' columns: %s", dataset_name, avail_cols
