@@ -10,19 +10,15 @@ class LLAMA_MODEL:
         self.attn_implementation = attn_implementation
         self.lm, self.tokenizer = self._load_model()
         self.lm.eval()
-        # weights already placed on self.device with the correct dtype via
-        # device_map + torch_dtype in from_pretrained; no extra .to() needed
+        self.lm.to(self.device)
 
     def _load_model(self):
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, padding_side="left")
         # `torch_dtype` is the correct kwarg for from_pretrained (not `dtype`)
-        # `device_map` loads weights directly onto the target device, avoiding
-        # a redundant CPU→GPU copy when self.device == "cuda".
         lm = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             attn_implementation=self.attn_implementation,
             torch_dtype=self.dtype,
-            device_map=self.device,
         )
         return lm, tokenizer
 
