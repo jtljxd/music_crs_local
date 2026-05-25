@@ -75,13 +75,19 @@ def main(args):
         retrieval_type=config.retrieval_type,
         item_db_name=config.item_db_name,
         user_db_name=config.user_db_name,
+        track_emb_db_name=config.get("track_emb_db_name", "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"),
+        user_emb_db_name=config.get("user_emb_db_name", "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"),
         track_split_types=config.track_split_types,
         user_split_types=config.user_split_types,
         corpus_types=config.corpus_types,
         cache_dir=config.cache_dir,
         device=config.device,
         attn_implementation=config.attn_implementation,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        retrieval_topk=int(config.get("retrieval_topk", 20)),
+        fm_k=int(config.get("fm_k", 16)),
+        fm_lr=float(config.get("fm_lr", 1e-3)),
+        fm_top_tags=int(config.get("fm_top_tags", 50)),
     )
     db = load_dataset(config.test_dataset_name, split="test")
     # Prepare all batch data at once
