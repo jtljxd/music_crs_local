@@ -193,6 +193,11 @@ class CRS_BASELINE_V2:
             context.append(f"{role}: {content}")
         return "\n".join(context)
     
+    def set_turn_store(self, store: dict):
+        """Inject pre-computed turn embedding store into retrieval + reranker."""
+        self.retrieval.set_turn_store(store)
+        self.reranker.set_turn_store(store)
+
     def chat(
         self,
         user_query: str,
@@ -200,6 +205,8 @@ class CRS_BASELINE_V2:
         session_memory: Optional[List[Dict[str, Any]]] = None,
         conversation_goal: Optional[Dict] = None,
         session_date: Optional[str] = None,
+        session_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Single-turn chat.
         
@@ -224,6 +231,8 @@ class CRS_BASELINE_V2:
             user_id=user_id,
             current_query=user_query,
             history_queries=history_queries,
+            session_id=session_id,
+            turn_number=turn_number,
         )
         
         # Three-tower reranking
@@ -235,6 +244,8 @@ class CRS_BASELINE_V2:
             history_context=history_context,
             conversation_goal=conversation_goal,
             session_date=session_date or "",
+            session_id=session_id,
+            turn_number=turn_number,
         )
         
         # Take top K
@@ -272,17 +283,20 @@ class CRS_BASELINE_V2:
         
         Args:
             batch_data: List of dicts with keys: user_query, user_id, session_memory, 
-                       conversation_goal (optional), session_date (optional)
+                       conversation_goal (optional), session_date (optional),
+                       session_id (optional), turn_number (optional)
         
         Returns:
             List of result dicts
         """
         # Extract batch inputs
-        user_ids = [d.get("user_id") for d in batch_data]
-        user_queries = [d["user_query"] for d in batch_data]
-        session_memories = [d.get("session_memory", []) for d in batch_data]
+        user_ids           = [d.get("user_id") for d in batch_data]
+        user_queries       = [d["user_query"] for d in batch_data]
+        session_memories   = [d.get("session_memory", []) for d in batch_data]
         conversation_goals = [d.get("conversation_goal") for d in batch_data]
-        session_dates = [d.get("session_date", "") for d in batch_data]
+        session_dates      = [d.get("session_date", "") for d in batch_data]
+        session_ids        = [d.get("session_id") for d in batch_data]
+        turn_numbers       = [d.get("turn_number") for d in batch_data]
         
         # Extract history queries for each session
         history_queries_list = []
@@ -295,6 +309,8 @@ class CRS_BASELINE_V2:
             user_ids=user_ids,
             current_queries=user_queries,
             history_queries_list=history_queries_list,
+            session_ids=session_ids,
+            turn_numbers=turn_numbers,
         )
         
         # Batch reranking
@@ -306,6 +322,8 @@ class CRS_BASELINE_V2:
             history_contexts=history_contexts,
             conversation_goals=conversation_goals,
             session_dates=session_dates,
+            session_ids=session_ids,
+            turn_numbers=turn_numbers,
         )
         
         # Take top K for each

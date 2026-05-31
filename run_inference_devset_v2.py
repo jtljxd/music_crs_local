@@ -1,9 +1,10 @@
 """
 Batch inference script for Music CRS with support for V2 pipeline.
 
-For the V2 pipeline, all Qwen text embeddings (user queries + history contexts)
-are pre-computed in a single batch pass BEFORE inference begins.  This avoids
-repeated CPU-Qwen forward passes during the hot inference loop.
+For the V2 pipeline, all Qwen text embeddings are pre-computed once via
+precompute_turn_embeddings.py and stored in cache/turn_embeddings.pt.
+During inference, retrieval and reranker look up embeddings by
+(session_id, turn_number) with O(1) dict access — no Qwen forward passes.
 """
 
 import os
@@ -22,22 +23,12 @@ def chat_history_parser(conversations, music_crs, target_turn_number):
     """
     Parse conversation history up to a target turn.
 
-    Args:
-        conversations (List[Dict]): List of conversation turn dictionaries containing:
-            - turn_number: Turn index (1-8)
-            - role: Speaker role ('user', 'assistant', 'music')
-            - content: Message content or track ID
-        music_crs: CRS baseline instance (used to convert track IDs to metadata)
-        target_turn_number (int): The turn to predict (history excludes this turn)
-
     Returns:
-        Tuple[List[Dict], str]:
-            - chat_history: List of previous messages formatted as [{"role": ..., "content": ...}]
-            - user_query: The user query at the target turn
+        (chat_history: List[Dict], user_query: str)
     """
     df_conversation = pd.DataFrame(conversations)
-    df_history = df_conversation[df_conversation['turn_number'] < target_turn_number]
-    chat_history = []
+    df_history      = df_conversation[df_conversation['turn_number'] < target_turn_number]
+    chat_history    = []
     for turn_data in df_history.to_dict(orient="records"):
         current_role    = turn_data['role']
         current_content = turn_data['content']
@@ -46,77 +37,21 @@ def chat_history_parser(conversations, music_crs, target_turn_number):
             current_content = music_crs.item_db.id_to_metadata(turn_data['content'])
         chat_history.append({"role": current_role, "content": current_content})
     df_current_turn = df_conversation[df_conversation['turn_number'] == target_turn_number]
-    user_query = df_current_turn.iloc[0]['content']
+    user_query      = df_current_turn.iloc[0]['content']
     return chat_history, user_query
 
 
-def _format_history_context(chat_history: List[Dict]) -> str:
-    """Format chat history as a string (mirrors crs_baseline_v2._format_history_context)."""
-    return "\n".join(f"{m['role']}: {m['content']}" for m in chat_history)
-
-
-def _collect_all_texts(batch_data: List[Dict]) -> List[str]:
-    """Collect every unique text that will need a Qwen embedding during inference."""
-    texts = set()
-    for d in batch_data:
-        query   = d.get("user_query", "")
-        history = _format_history_context(d.get("session_memory", []))
-        # history queries (individual user turns)
-        for msg in d.get("session_memory", []):
-            if msg.get("role") == "user":
-                texts.add(msg["content"])
-        if query:
-            texts.add(query)
-        if history:
-            texts.add(history)
-        # conversation_goal fields (if present)
-        goal = d.get("conversation_goal") or {}
-        for field in ("listener_goal", "category"):
-            val = goal.get(field, "")
-            if val:
-                texts.add(val)
-    return [t for t in texts if t and t.strip()]
-
-
-def precompute_qwen_embeddings(
-    batch_data: List[Dict],
-    qwen_model_path: str,
-    cache_file: str,
-    batch_size: int = 128,
-):
-    """Pre-compute Qwen embeddings for ALL texts in batch_data.
-
-    Skips already-cached texts so re-runs are fast.
-    """
-    from mcrs.qwen_cache import QwenEmbeddingCache
-
-    print("Collecting unique texts for Qwen precompute …")
-    texts = _collect_all_texts(batch_data)
-    print(f"  {len(texts)} unique non-empty texts found.")
-
-    cache = QwenEmbeddingCache(qwen_model_path, cache_file=cache_file)
-
-    missing = [t for t in texts if t not in cache]
-    print(f"  {len(missing)} texts not yet cached; encoding now …")
-    if missing:
-        cache.precompute(missing, batch_size=batch_size)
-    else:
-        print("  All texts already cached — skipping Qwen forward pass.")
-
-    return cache
-
-
 def main(args):
-    """
-    Run batch inference on TalkPlayData-2 test dataset.
-    """
     print("Removing cache directory for preventing memory issues...")
     os.system("rm -rf cache")
+
     config           = OmegaConf.load(f"config/{args.tid}.yaml")
     pipeline_version = config.get("pipeline_version", "v1")
-    qwen_model_path  = config.get("qwen_model_path",
-                                   "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B")
-    cache_dir        = config.cache_dir
+    qwen_model_path  = config.get(
+        "qwen_model_path",
+        "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
+    )
+    cache_dir = config.cache_dir
 
     # ── Load the CRS pipeline ─────────────────────────────────────────────
     if pipeline_version == "v2":
@@ -188,9 +123,11 @@ def main(args):
                 item['conversations'], music_crs, target_turn_number
             )
             batch_data.append({
-                'user_query':    user_query,
-                'user_id':       user_id,
+                'user_query':     user_query,
+                'user_id':        user_id,
                 'session_memory': chat_history,
+                'session_id':     session_id,       # ← new
+                'turn_number':    target_turn_number,  # ← new
             })
             metadata.append({
                 'session_id':  session_id,
@@ -198,19 +135,23 @@ def main(args):
                 'turn_number': target_turn_number,
             })
 
-    # ── Pre-compute Qwen embeddings (V2 only) ─────────────────────────────
+    # ── Load / build turn-embedding store (V2 only) ───────────────────────
     if pipeline_version == "v2":
-        qwen_cache_file = os.path.join(cache_dir, "qwen_text_emb.pt")
-        qwen_cache = precompute_qwen_embeddings(
-            batch_data,
-            qwen_model_path=qwen_model_path,
-            cache_file=qwen_cache_file,
-            batch_size=128,
-        )
-        # Inject the pre-computed cache into the pipeline modules
-        music_crs.retrieval.set_embedding_cache(qwen_cache)
-        music_crs.reranker.set_embedding_cache(qwen_cache)
-        print(f"Qwen cache injected: {len(qwen_cache)} entries.")
+        turn_store_path = os.path.join(cache_dir, "turn_embeddings.pt")
+
+        if not os.path.exists(turn_store_path):
+            print(f"Turn embedding store not found at {turn_store_path}.")
+            print("Run first:  python precompute_turn_embeddings.py "
+                  f"--out {turn_store_path} --split test")
+            raise FileNotFoundError(
+                f"Missing pre-computed turn embeddings: {turn_store_path}\n"
+                "Please run precompute_turn_embeddings.py before inference."
+            )
+
+        print(f"Loading turn embedding store from {turn_store_path} …")
+        turn_store = torch.load(turn_store_path, map_location="cpu")
+        print(f"  {len(turn_store)} entries loaded.")
+        music_crs.set_turn_store(turn_store)
 
     # ── Run inference ─────────────────────────────────────────────────────
     inference_results = []
@@ -220,11 +161,11 @@ def main(args):
         results        = music_crs.batch_chat(batch)
         for j, result in enumerate(results):
             inference_results.append({
-                "session_id":         batch_metadata[j]['session_id'],
-                "user_id":            batch_metadata[j]['user_id'],
-                "turn_number":        batch_metadata[j]['turn_number'],
+                "session_id":          batch_metadata[j]['session_id'],
+                "user_id":             batch_metadata[j]['user_id'],
+                "turn_number":         batch_metadata[j]['turn_number'],
                 "predicted_track_ids": result['retrieval_items'],
-                "predicted_response": result["response"],
+                "predicted_response":  result["response"],
             })
 
     os.makedirs("exp/inference/devset", exist_ok=True)
@@ -236,24 +177,18 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run batch inference on TalkPlayData-2 test dataset for Music CRS evaluation."
+        description="Batch inference for Music CRS (V1 / V2 pipeline)."
     )
     parser.add_argument(
-        "--tid",
-        type=str,
-        default="llama1b_multi_channel_devset",
-        help="Task identifier matching a config file (e.g., 'llama1b_multi_channel_devset')",
+        "--tid", type=str, default="llama1b_multi_channel_devset",
+        help="Config identifier (loads config/{tid}.yaml)",
     )
     parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-        help="Number of queries per batch.  Reduce if OOM.",
+        "--batch_size", type=int, default=16,
+        help="Batch size for inference.",
     )
     parser.add_argument(
-        "--save_path",
-        type=str,
-        default="./exp/inference",
+        "--save_path", type=str, default="./exp/inference",
         help="(Unused) base output directory.",
     )
     args = parser.parse_args()

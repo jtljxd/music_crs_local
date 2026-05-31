@@ -626,87 +626,30 @@ class ThreeTowerRerankerWrapper:
 
     # ── text encoding ────────────────────────────────────────────────────────
 
-    def set_embedding_cache(self, cache):
-        """Inject a pre-computed QwenEmbeddingCache.
+    def set_turn_store(self, store: dict):
+        """Inject a pre-computed turn embedding store.
 
-        Once set, _encode_text / _encode_texts_batch will look up embeddings
-        from the cache instead of running Qwen forward pass.
+        store: dict  key='{session_id}__{turn}_{role}'  value=float16 [128]
         """
+        self._turn_store = store
+        logger.info("Turn store injected into ThreeTowerRerankerWrapper (%d entries).", len(store))
+
+    # kept for legacy / fallback
+    def set_embedding_cache(self, cache):
+        """Inject a QwenEmbeddingCache (legacy; prefer set_turn_store)."""
         self._qwen_cache = cache
         logger.info("QwenEmbeddingCache injected into ThreeTowerRerankerWrapper (%d entries).", len(cache))
 
-    def _encode_text(self, text: str, max_dim: int = 128) -> torch.Tensor:
-        """Look up from pre-computed cache; fall back to Qwen model."""
-        if not text or not text.strip():
-            return torch.zeros(max_dim)
-
-        # 1. Pre-computed cache
-        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
-            return self._qwen_cache.get(text, dim=max_dim, normalize=True)
-
-        # 2. Per-instance runtime cache
-        cache_key = (text, max_dim)
-        if not hasattr(self, "_encode_cache"):
-            self._encode_cache: Dict[Tuple[str, int], torch.Tensor] = {}
-        if cache_key in self._encode_cache:
-            return self._encode_cache[cache_key]
-
-        self.qwen_model.eval()
-        with torch.no_grad():
-            inputs  = self.tokenizer(text, return_tensors="pt", padding=True,
-                                     truncation=True, max_length=512)
-            outputs = self.qwen_model(**inputs)
-            attn    = inputs["attention_mask"]
-            tok_emb = outputs.last_hidden_state
-            mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
-            emb     = torch.sum(tok_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-            result  = emb[:, :max_dim].squeeze(0)
-
-        if len(self._encode_cache) >= 8192:
-            self._encode_cache.clear()
-        self._encode_cache[cache_key] = result
-        return result
-
-    def _encode_texts_batch(self, texts: List[str], max_dim: int = 128) -> List[torch.Tensor]:
-        """Batch-encode texts; use pre-computed cache for all hits."""
-        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
-            return self._qwen_cache.get_batch(texts, dim=max_dim, normalize=True)
-
-        # Fall back to runtime cache + on-the-fly encoding
-        if not hasattr(self, "_encode_cache"):
-            self._encode_cache: Dict[Tuple[str, int], torch.Tensor] = {}
-
-        results   = [None] * len(texts)
-        to_encode = []
-        for i, text in enumerate(texts):
-            if not text or not text.strip():
-                results[i] = torch.zeros(max_dim)
-            elif (text, max_dim) in self._encode_cache:
-                results[i] = self._encode_cache[(text, max_dim)]
-            else:
-                to_encode.append((i, text))
-
-        if to_encode:
-            indices, raw_texts = zip(*to_encode)
-            self.qwen_model.eval()
-            with torch.no_grad():
-                inputs  = self.tokenizer(list(raw_texts), return_tensors="pt",
-                                         padding=True, truncation=True, max_length=512)
-                outputs = self.qwen_model(**inputs)
-                attn    = inputs["attention_mask"]
-                tok_emb = outputs.last_hidden_state
-                mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
-                embs    = torch.sum(tok_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-                embs    = embs[:, :max_dim]
-
-            if len(self._encode_cache) >= 8192:
-                self._encode_cache.clear()
-            for j, (orig_idx, text) in enumerate(zip(indices, raw_texts)):
-                vec = embs[j]
-                self._encode_cache[(text, max_dim)] = vec
-                results[orig_idx] = vec
-
-        return results
+    def _get_turn_emb(self, session_id: Optional[str], turn_number: Optional[int],
+                      role: str, fallback_text: str, dim: int = 128) -> torch.Tensor:
+        """Look up turn store; fall back to text encoding if not found."""
+        store = getattr(self, "_turn_store", None)
+        if store is not None and session_id and turn_number is not None:
+            key = f"{session_id}__{turn_number}_{role}"
+            if key in store:
+                vec = store[key].float()[:dim]
+                return F.normalize(vec.unsqueeze(0), p=2, dim=1).squeeze(0)
+        return self._encode_text(fallback_text, max_dim=dim)
 
     # ── inference ───────────────────────────────────────────────────────────
 
@@ -718,22 +661,29 @@ class ThreeTowerRerankerWrapper:
         history_context: str = "",
         conversation_goal: Dict = None,
         session_date: str = "",
+        session_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
     ) -> List[str]:
-        """Rerank candidates; returns track IDs sorted best-first."""
+        """Rerank candidates; returns track IDs sorted best-first.
+
+        When session_id + turn_number are provided and a turn store is loaded,
+        all Qwen calls are replaced by O(1) dict lookups.
+        """
         if not candidate_track_ids:
             return candidate_track_ids
 
         N = len(candidate_track_ids)
         self.model.eval()
         with torch.no_grad():
-            # ── intent features: batch-encode all 4 texts in ONE forward pass ──
-            listener_goal = conversation_goal.get("listener_goal", "") if conversation_goal else ""
-            category      = conversation_goal.get("category", "")      if conversation_goal else ""
-
-            encoded = self._encode_texts_batch(
-                [current_query, history_context, listener_goal, category], max_dim=128
-            )
-            query_emb, history_emb, listener_goal_emb, category_emb = encoded
+            # ── intent embeddings via turn store or text encode ───────────
+            query_emb        = self._get_turn_emb(session_id, turn_number, "user",
+                                                  current_query, dim=128)
+            history_emb      = self._get_turn_emb(session_id, turn_number, "history_avg",
+                                                  history_context, dim=128)
+            listener_goal    = conversation_goal.get("listener_goal", "") if conversation_goal else ""
+            category         = conversation_goal.get("category",      "") if conversation_goal else ""
+            listener_goal_emb = self._encode_text(listener_goal, max_dim=128)
+            category_emb      = self._encode_text(category,      max_dim=128)
 
             intent_features = (
                 torch.cat([query_emb, history_emb, listener_goal_emb, category_emb])
@@ -742,8 +692,8 @@ class ThreeTowerRerankerWrapper:
 
             # ── user features + cf_bpr_missing mask ──────────────────────
             if user_id and user_id in self.user_embeddings:
-                user_data = self.user_embeddings[user_id]
-                raw_bpr   = user_data["cf-bpr"].to(self.device)
+                user_data      = self.user_embeddings[user_id]
+                raw_bpr        = user_data["cf-bpr"].to(self.device)
                 is_bpr_missing = "cf-bpr" in user_data["__missing__"]
             else:
                 raw_bpr        = torch.zeros(self.USER_CF_BPR_TARGET_DIM, device=self.device)
@@ -758,8 +708,7 @@ class ThreeTowerRerankerWrapper:
 
             # ── item modal embeddings + modal_missing_mask ───────────────
             modal_lists: List[List[torch.Tensor]] = [[] for _ in self.TRACK_MODAL_COLS]
-            # missing_flags[i][n] = True if sample n is missing modality i
-            missing_flags: List[List[bool]] = [[] for _ in self.TRACK_MODAL_COLS]
+            missing_flags: List[List[bool]]        = [[] for _ in self.TRACK_MODAL_COLS]
 
             for track_id in candidate_track_ids:
                 if track_id in self.track_embeddings:
@@ -767,7 +716,7 @@ class ThreeTowerRerankerWrapper:
                     missing = set(embs["__missing__"])
                 else:
                     embs    = {}
-                    missing = set(self.TRACK_MODAL_COLS)   # all missing
+                    missing = set(self.TRACK_MODAL_COLS)
 
                 for i, col in enumerate(self.TRACK_MODAL_COLS):
                     if col in missing or col not in embs:
@@ -779,12 +728,11 @@ class ThreeTowerRerankerWrapper:
 
             modal_embs = [torch.stack(lst).to(self.device) for lst in modal_lists]
 
-            # modal_missing_mask: [N, num_modals]
             modal_missing_mask = torch.tensor(
-                list(zip(*missing_flags)),   # shape: [N, num_modals]
+                list(zip(*missing_flags)),
                 dtype=torch.bool,
                 device=self.device,
-            )
+            )  # [N, num_modals]
 
             item_categorical = {}
 
@@ -810,17 +758,22 @@ class ThreeTowerRerankerWrapper:
         history_contexts: List[str] = None,
         conversation_goals: List[Dict] = None,
         session_dates: List[str] = None,
+        session_ids: Optional[List[Optional[str]]] = None,
+        turn_numbers: Optional[List[Optional[int]]] = None,
     ) -> List[List[str]]:
-        if history_contexts  is None: history_contexts  = [""] * len(user_ids)
+        if history_contexts   is None: history_contexts   = [""] * len(user_ids)
         if conversation_goals is None: conversation_goals = [None] * len(user_ids)
         if session_dates      is None: session_dates      = [""] * len(user_ids)
+        if session_ids        is None: session_ids        = [None] * len(user_ids)
+        if turn_numbers       is None: turn_numbers       = [None] * len(user_ids)
 
         return [
-            self.rerank(uid, cands, q, hist, goal, date)
-            for uid, cands, q, hist, goal, date in zip(
+            self.rerank(uid, cands, q, hist, goal, date, sid, tn)
+            for uid, cands, q, hist, goal, date, sid, tn in zip(
                 user_ids, batch_candidate_track_ids,
                 current_queries, history_contexts,
                 conversation_goals, session_dates,
+                session_ids, turn_numbers,
             )
         ]
 

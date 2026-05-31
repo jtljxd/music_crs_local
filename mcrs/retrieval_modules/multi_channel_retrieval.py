@@ -366,12 +366,19 @@ class MultiChannelRetrieval:
 
     # ── query encoding ───────────────────────────────────────────────────────
 
-    def set_embedding_cache(self, cache):
-        """Inject a pre-computed QwenEmbeddingCache.
+    def set_turn_store(self, store: dict):
+        """Inject a pre-computed turn embedding store.
 
-        Once set, _encode_query will look up embeddings from the cache
-        (dim=256, normalised) instead of running Qwen forward pass.
+        store: dict  key='{session_id}__{turn}_{role}'  value=float16 [128]
+        Once set, retrieve() can skip all Qwen calls when session_id+turn_number
+        are provided.
         """
+        self._turn_store = store
+        logger.info("Turn store injected into MultiChannelRetrieval (%d entries).", len(store))
+
+    # kept for fallback / standalone use
+    def set_embedding_cache(self, cache):
+        """Inject a pre-computed QwenEmbeddingCache (legacy; prefer set_turn_store)."""
         self._qwen_cache = cache
         logger.info("QwenEmbeddingCache injected into MultiChannelRetrieval (%d entries).", len(cache))
 
@@ -471,18 +478,43 @@ class MultiChannelRetrieval:
         user_id: Optional[str],
         current_query: str,
         history_queries: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
     ) -> List[str]:
-        """Multi-channel retrieval; returns deduplicated track list (~350)."""
+        """Multi-channel retrieval; returns deduplicated track list (~350).
+
+        If session_id and turn_number are provided AND a turn store is loaded,
+        embeddings are looked up directly (no Qwen forward pass).
+        """
         if history_queries is None:
             history_queries = []
 
-        current_emb = self._encode_query(current_query)
-        if history_queries:
-            hist_embs   = [self._encode_query(q) for q in history_queries]
-            hist_emb    = torch.stack(hist_embs).mean(dim=0)
-            query_emb   = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
+        store = getattr(self, "_turn_store", None)
+        if store is not None and session_id is not None and turn_number is not None:
+            user_key  = f"{session_id}__{turn_number}_user"
+            hist_key  = f"{session_id}__{turn_number}_history_avg"
+            current_emb = (
+                store[user_key].float() if user_key in store
+                else self._encode_query(current_query)
+            )
+            hist_emb_raw = (
+                store[hist_key].float() if hist_key in store else None
+            )
+            current_emb = F.normalize(current_emb.unsqueeze(0)[:, :256], p=2, dim=1).squeeze(0)
+            if hist_emb_raw is not None:
+                hist_emb = F.normalize(hist_emb_raw.unsqueeze(0)[:, :256], p=2, dim=1).squeeze(0)
+                query_emb = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
+            else:
+                query_emb = current_emb
         else:
-            query_emb = current_emb
+            # Fallback: text-based encoding
+            current_emb = self._encode_query(current_query)
+            if history_queries:
+                hist_embs = [self._encode_query(q) for q in history_queries]
+                hist_emb  = torch.stack(hist_embs).mean(dim=0)
+                query_emb = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
+            else:
+                query_emb = current_emb
 
         ch1 = self._retrieve_cf_bpr(user_id, USER_MUSIC_TOWER_RECALL_NUM)
         ch2 = self._retrieve_similar_users_music(user_id)
@@ -504,10 +536,17 @@ class MultiChannelRetrieval:
         user_ids: List[Optional[str]],
         current_queries: List[str],
         history_queries_list: Optional[List[List[str]]] = None,
+        session_ids: Optional[List[Optional[str]]] = None,
+        turn_numbers: Optional[List[Optional[int]]] = None,
     ) -> List[List[str]]:
         if history_queries_list is None:
             history_queries_list = [[] for _ in user_ids]
+        if session_ids is None:
+            session_ids = [None] * len(user_ids)
+        if turn_numbers is None:
+            turn_numbers = [None] * len(user_ids)
         return [
-            self.retrieve(uid, q, hist)
-            for uid, q, hist in zip(user_ids, current_queries, history_queries_list)
+            self.retrieve(uid, q, hist, sid, tn)
+            for uid, q, hist, sid, tn
+            in zip(user_ids, current_queries, history_queries_list, session_ids, turn_numbers)
         ]
