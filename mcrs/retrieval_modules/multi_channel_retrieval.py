@@ -117,23 +117,81 @@ class MultiChannelRetrieval:
         concat_ds = concatenate_datasets([ds[s] for s in valid_splits])
         return {item["user_id"]: item for item in concat_ds}
     
+    @staticmethod
+    def _safe_tensor(value, expected_min_dim: int = 1) -> Optional[torch.Tensor]:
+        """Safely convert a value to a float32 tensor.
+
+        Returns None if the value is None/empty or not a valid sequence.
+        """
+        if value is None:
+            return None
+        try:
+            t = torch.tensor(value, dtype=torch.float32)
+            if t.ndim == 0 or t.numel() < expected_min_dim:
+                return None
+            return t
+        except (TypeError, ValueError):
+            return None
+
     def _load_track_embeddings(self, dataset_name: str, split_types: List[str]) -> Dict:
-        """Load track embeddings (all modalities)."""
+        """Load track embeddings (all modalities).
+
+        Tracks whose required columns are None / empty are skipped so that
+        downstream torch.stack calls never see tensors of inconsistent shape.
+        """
         ds = load_dataset(dataset_name)
         valid_splits = [s for s in split_types if s in ds.keys()] or list(ds.keys())
         concat_ds = concatenate_datasets([ds[s] for s in valid_splits])
-        
+
+        # Detect cf-bpr dimension from the first valid row
+        cf_bpr_dim: Optional[int] = None
+        metadata_dim: Optional[int] = None
+        attributes_dim: Optional[int] = None
+
         embeddings = {}
+        skipped = 0
         for item in concat_ds:
             track_id = item["track_id"]
+
+            cf_bpr      = self._safe_tensor(item.get("cf-bpr"))
+            audio       = self._safe_tensor(item.get("audio-laion_clap"))
+            image       = self._safe_tensor(item.get("image-siglip2"))
+            attributes  = self._safe_tensor(item.get("attributes-qwen3_embedding_0.6b"))
+            lyrics      = self._safe_tensor(item.get("lyrics-qwen3_embedding_0.6b"))
+            metadata    = self._safe_tensor(item.get("metadata-qwen3_embedding_0.6b"))
+
+            # Skip tracks that are missing any required embedding
+            if any(t is None for t in [cf_bpr, audio, image, attributes, lyrics, metadata]):
+                skipped += 1
+                continue
+
+            # On first valid row, record expected dimensions
+            if cf_bpr_dim is None:
+                cf_bpr_dim     = cf_bpr.shape[0]
+                metadata_dim   = metadata.shape[0]
+                attributes_dim = attributes.shape[0]
+
+            # Skip tracks whose dimension doesn't match the expected size
+            if (cf_bpr.shape[0] != cf_bpr_dim or
+                    metadata.shape[0] != metadata_dim or
+                    attributes.shape[0] != attributes_dim):
+                skipped += 1
+                continue
+
             embeddings[track_id] = {
-                "cf-bpr": torch.tensor(item["cf-bpr"], dtype=torch.float32),
-                "audio-laion_clap": torch.tensor(item["audio-laion_clap"], dtype=torch.float32),
-                "image-siglip2": torch.tensor(item["image-siglip2"], dtype=torch.float32),
-                "attributes-qwen3_embedding_0.6b": torch.tensor(item["attributes-qwen3_embedding_0.6b"], dtype=torch.float32),
-                "lyrics-qwen3_embedding_0.6b": torch.tensor(item["lyrics-qwen3_embedding_0.6b"], dtype=torch.float32),
-                "metadata-qwen3_embedding_0.6b": torch.tensor(item["metadata-qwen3_embedding_0.6b"], dtype=torch.float32),
+                "cf-bpr":                           cf_bpr,
+                "audio-laion_clap":                  audio,
+                "image-siglip2":                     image,
+                "attributes-qwen3_embedding_0.6b":   attributes,
+                "lyrics-qwen3_embedding_0.6b":        lyrics,
+                "metadata-qwen3_embedding_0.6b":     metadata,
             }
+
+        if skipped:
+            logger.warning(
+                "Skipped %d tracks with missing/invalid embeddings during loading.", skipped
+            )
+        logger.info("Loaded %d tracks with valid embeddings.", len(embeddings))
         return embeddings
     
     def _load_user_embeddings(self, dataset_name: str, split_types: List[str]) -> Dict:
@@ -228,22 +286,46 @@ class MultiChannelRetrieval:
         
         logger.info("Building track indices...")
         track_ids = sorted(self.track_embeddings.keys())
-        self.track_ids_list = track_ids
-        
-        # Build matrices
+
+        # Build matrices – only keep tracks that have all valid embeddings
         cf_bpr_list = []
         metadata_list = []
         attributes_list = []
-        
+        valid_track_ids = []
+
         for track_id in track_ids:
             embs = self.track_embeddings[track_id]
-            cf_bpr_list.append(embs["cf-bpr"])
+            cf_bpr = embs.get("cf-bpr")
+            metadata = embs.get("metadata-qwen3_embedding_0.6b")
+            attributes = embs.get("attributes-qwen3_embedding_0.6b")
+
+            if cf_bpr is None or metadata is None or attributes is None:
+                continue
+            if cf_bpr.ndim != 1 or metadata.ndim != 1 or attributes.ndim != 1:
+                continue
+
+            cf_bpr_list.append(cf_bpr)
             # Take first 256 dims
-            metadata_list.append(embs["metadata-qwen3_embedding_0.6b"][:256])
-            attributes_list.append(embs["attributes-qwen3_embedding_0.6b"][:256])
-        
-        self.track_cf_bpr_matrix = torch.stack(cf_bpr_list)  # [N, 128]
-        self.track_metadata_matrix = torch.stack(metadata_list)  # [N, 256]
+            metadata_list.append(metadata[:256])
+            attributes_list.append(attributes[:256])
+            valid_track_ids.append(track_id)
+
+        if not cf_bpr_list:
+            raise RuntimeError(
+                "No valid track embeddings found – cannot build retrieval index. "
+                "Check that the track embedding dataset columns are non-empty."
+            )
+
+        # track_ids_list must be aligned with the matrix rows
+        self.track_ids_list = valid_track_ids
+        logger.info(
+            "Using %d / %d tracks for retrieval index "
+            "(tracks with incomplete embeddings are skipped).",
+            len(valid_track_ids), len(track_ids),
+        )
+
+        self.track_cf_bpr_matrix = torch.stack(cf_bpr_list)       # [N, cf_bpr_dim]
+        self.track_metadata_matrix = torch.stack(metadata_list)    # [N, 256]
         self.track_attributes_matrix = torch.stack(attributes_list)  # [N, 256]
         
         # Normalize for cosine similarity
@@ -257,8 +339,8 @@ class MultiChannelRetrieval:
         torch.save(self.track_attributes_matrix, attributes_path)
         with open(track_ids_path, "w") as f:
             json.dump(self.track_ids_list, f)
-        
-        logger.info(f"Track indices built and saved. Total tracks: {len(track_ids)}")
+
+        logger.info("Track indices built and saved. Total valid tracks: %d", len(self.track_ids_list))
     
     def _encode_query(self, query: str) -> torch.Tensor:
         """Encode query using Qwen model, return first 256 dims."""
