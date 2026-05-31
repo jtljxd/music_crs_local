@@ -231,13 +231,13 @@ class CRS_BASELINE_V2:
         if recommend_track_id:
             track_metadata_str = self.item_db.id_to_metadata(recommend_track_id)
             self.session_memory.append({"role": "user", "content": user_query})
-            
+
             system_prompt = self._get_system_prompt(user_id)
-            messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(self.session_memory)
-            messages.append({"role": "assistant", "content": track_metadata_str})
-            
-            response = self.lm.generate(messages)
+            response = self.lm.response_generation(
+                system_prompt,
+                self.session_memory,
+                track_metadata_str,
+            )
             self.session_memory.append({"role": "assistant", "content": response})
         else:
             response = "I couldn't find a suitable track for you."
@@ -304,28 +304,49 @@ class CRS_BASELINE_V2:
             tracks[0] if tracks else None for tracks in batch_final_track_ids
         ]
         
-        # Batch generate responses
+        # Build per-sample generation inputs
         batch_messages = []
         for i, data in enumerate(batch_data):
             if recommend_items[i]:
                 track_metadata_str = self.item_db.id_to_metadata(recommend_items[i])
-                system_prompt = self._get_system_prompt(data.get("user_id"))
-                messages = [{"role": "system", "content": system_prompt}]
-                messages.extend(session_memories[i])
-                messages.append({"role": "user", "content": user_queries[i]})
-                messages.append({"role": "assistant", "content": track_metadata_str})
-                batch_messages.append(messages)
+                system_prompt      = self._get_system_prompt(data.get("user_id"))
+                # chat_history for lm: session messages so far + current user turn
+                chat_history = list(session_memories[i]) + [
+                    {"role": "user", "content": user_queries[i]}
+                ]
+                batch_messages.append({
+                    "sys_prompt":     system_prompt,
+                    "chat_history":   chat_history,
+                    "recommend_item": track_metadata_str,
+                })
             else:
                 batch_messages.append(None)
         
-        # Generate responses
-        responses = []
-        for messages in batch_messages:
-            if messages:
-                response = self.lm.generate(messages)
-                responses.append(response)
+        # Batch generate responses using batch_response_generation
+        valid_indices   = [i for i, m in enumerate(batch_messages) if m is not None]
+        invalid_indices = [i for i, m in enumerate(batch_messages) if m is None]
+
+        responses = [None] * len(batch_data)
+        for i in invalid_indices:
+            responses[i] = "I couldn't find a suitable track for you."
+
+        if valid_indices:
+            sys_prompts_valid    = [batch_messages[i]["sys_prompt"]    for i in valid_indices]
+            chat_histories_valid = [batch_messages[i]["chat_history"]  for i in valid_indices]
+            recommend_items_valid = [batch_messages[i]["recommend_item"] for i in valid_indices]
+
+            if hasattr(self.lm, "batch_response_generation"):
+                generated = self.lm.batch_response_generation(
+                    sys_prompts_valid, chat_histories_valid, recommend_items_valid
+                )
             else:
-                responses.append("I couldn't find a suitable track for you.")
+                generated = [
+                    self.lm.response_generation(sp, ch, ri)
+                    for sp, ch, ri in zip(sys_prompts_valid, chat_histories_valid, recommend_items_valid)
+                ]
+
+            for idx, gen in zip(valid_indices, generated):
+                responses[idx] = gen
         
         # Build results
         results = []
