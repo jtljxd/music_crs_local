@@ -224,7 +224,6 @@ def main(args):
         logger.info("  %d sessions total.", total_sessions)
 
         chunk_size = args.sessions_per_chunk
-        save_every = args.save_every   # save every N sessions
 
         added_total = 0
         pbar = tqdm(range(0, total_sessions, chunk_size),
@@ -237,9 +236,11 @@ def main(args):
             added_total += added
             pbar.set_postfix(store_size=len(store), new=added)
 
-            # Periodic save
-            if (chunk_start // chunk_size + 1) % (save_every // chunk_size + 1) == 0:
-                torch.save(store, out_path)
+            # Save after EVERY chunk so progress is never lost on OOM/crash
+            torch.save(store, out_path)
+            # Release GPU memory fragments after each chunk
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
         # Save after each split
         torch.save(store, out_path)
