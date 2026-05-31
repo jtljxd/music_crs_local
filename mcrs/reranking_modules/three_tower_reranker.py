@@ -478,8 +478,10 @@ class ThreeTowerRerankerWrapper:
         self.model = ThreeTowerReranker(
             intent_input_dim=512,
             tower_output_dim=128,
-            item_vocab_sizes=self.item_vocabs,
-            user_vocab_sizes=self.user_vocabs,
+            # Categorical features are not fed at inference time yet;
+            # pass empty dicts so fusion_dim == modal_dim (128) exactly.
+            item_vocab_sizes={},
+            user_vocab_sizes={},
         ).to(device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
