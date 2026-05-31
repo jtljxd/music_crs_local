@@ -452,6 +452,8 @@ class ThreeTowerRerankerWrapper:
         qwen_model_path: str = "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
         device: str = "cuda",
         lr: float = 1e-3,
+        qwen_model=None,       # pre-loaded shared instance (optional)
+        qwen_tokenizer=None,   # pre-loaded shared instance (optional)
     ):
         self.device          = device
         self.cache_dir       = cache_dir
@@ -469,17 +471,21 @@ class ThreeTowerRerankerWrapper:
         logger.info("Building vocabularies …")
         self.item_vocabs, self.user_vocabs = self._build_vocabularies()
 
-        logger.info("Loading Qwen model …")
-        self.tokenizer  = AutoTokenizer.from_pretrained(qwen_model_path)
-        self.qwen_model = AutoModel.from_pretrained(qwen_model_path)
-        self.qwen_model.to(device).eval()
+        # Use shared Qwen model if provided; otherwise load on CPU
+        if qwen_model is not None and qwen_tokenizer is not None:
+            logger.info("Using shared Qwen model (CPU).")
+            self.tokenizer  = qwen_tokenizer
+            self.qwen_model = qwen_model
+        else:
+            logger.info("Loading Qwen model on CPU …")
+            self.tokenizer  = AutoTokenizer.from_pretrained(qwen_model_path)
+            self.qwen_model = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
 
         logger.info("Initializing three-tower model …")
         self.model = ThreeTowerReranker(
             intent_input_dim=512,
             tower_output_dim=128,
-            # Categorical features are not fed at inference time yet;
-            # pass empty dicts so fusion_dim == modal_dim (128) exactly.
+            # Categorical features not fed at inference time yet
             item_vocab_sizes={},
             user_vocab_sizes={},
         ).to(device)
@@ -621,20 +627,20 @@ class ThreeTowerRerankerWrapper:
     # ── text encoding ────────────────────────────────────────────────────────
 
     def _encode_text(self, text: str, max_dim: int = 128) -> torch.Tensor:
-        """Mean-pool Qwen embeddings and take first max_dim dims."""
+        """Mean-pool Qwen embeddings on CPU; return first max_dim dims."""
         self.qwen_model.eval()
         with torch.no_grad():
-            inputs = self.tokenizer(
+            inputs  = self.tokenizer(
                 text, return_tensors="pt", padding=True,
                 truncation=True, max_length=512,
             )
-            inputs  = {k: v.to(self.device) for k, v in inputs.items()}
+            # Always run on CPU – Qwen is kept off GPU to save VRAM for the LLM
             outputs = self.qwen_model(**inputs)
             attn    = inputs["attention_mask"]
             tok_emb = outputs.last_hidden_state
             mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
             emb     = torch.sum(tok_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-            return emb[:, :max_dim].cpu().squeeze(0)
+            return emb[:, :max_dim].squeeze(0)  # [max_dim] on CPU
 
     # ── inference ───────────────────────────────────────────────────────────
 

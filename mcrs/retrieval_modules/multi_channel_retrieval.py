@@ -59,14 +59,16 @@ class MultiChannelRetrieval:
         qwen_model_path: str = "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
         device: str = "cuda",
         batch_size: int = 32,
+        qwen_model=None,       # pre-loaded shared instance (optional)
+        qwen_tokenizer=None,   # pre-loaded shared instance (optional)
     ):
-        self.dataset_name   = dataset_name
-        self.item_db_name   = item_db_name
-        self.cache_dir      = cache_dir
+        self.dataset_name    = dataset_name
+        self.item_db_name    = item_db_name
+        self.cache_dir       = cache_dir
         self.qwen_model_path = qwen_model_path
-        self.device         = device
-        self.batch_size     = batch_size
-        self.split_types    = split_types
+        self.device          = device
+        self.batch_size      = batch_size
+        self.split_types     = split_types
 
         self.index_dir = os.path.join(cache_dir, "multi_channel_retrieval")
         os.makedirs(self.index_dir, exist_ok=True)
@@ -82,10 +84,17 @@ class MultiChannelRetrieval:
         logger.info("Building user history index …")
         self.user_liked_music = self._build_user_history_index(dataset_name, split_types)
 
-        logger.info("Loading Qwen model …")
-        self.tokenizer  = AutoTokenizer.from_pretrained(qwen_model_path)
-        self.qwen_model = AutoModel.from_pretrained(qwen_model_path)
-        self.qwen_model.to(device).eval()
+        # Use shared Qwen model if provided; otherwise load from disk on CPU
+        if qwen_model is not None and qwen_tokenizer is not None:
+            logger.info("Using shared Qwen model (CPU).")
+            self.tokenizer  = qwen_tokenizer
+            self.qwen_model = qwen_model
+            self._qwen_device = "cpu"
+        else:
+            logger.info("Loading Qwen model on CPU …")
+            self.tokenizer  = AutoTokenizer.from_pretrained(qwen_model_path)
+            self.qwen_model = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
+            self._qwen_device = "cpu"
 
         logger.info("Building track embedding indices …")
         self._build_track_indices()
@@ -357,21 +366,21 @@ class MultiChannelRetrieval:
     # ── query encoding ───────────────────────────────────────────────────────
 
     def _encode_query(self, query: str) -> torch.Tensor:
-        """Encode query using Qwen model; return first 256 dims, L2-normalised."""
+        """Encode query using Qwen model (always on CPU); return first 256 dims, L2-normalised."""
         self.qwen_model.eval()
         with torch.no_grad():
             inputs = self.tokenizer(
                 query, return_tensors="pt", padding=True,
                 truncation=True, max_length=512,
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            outputs = self.qwen_model(**inputs)
+            # Always run on CPU – Qwen is kept off GPU to save VRAM for the LLM
+            outputs  = self.qwen_model(**inputs)
             attn_mask = inputs["attention_mask"]
             tok_embs  = outputs.last_hidden_state
             mask      = attn_mask.unsqueeze(-1).expand(tok_embs.size()).float()
             emb       = torch.sum(tok_embs * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
             emb       = emb[:, :256]
-            return F.normalize(emb, p=2, dim=1).cpu().squeeze(0)  # [256]
+            return F.normalize(emb, p=2, dim=1).squeeze(0)  # [256] on CPU
 
     # ── retrieval channels ───────────────────────────────────────────────────
 

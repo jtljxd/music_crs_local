@@ -91,12 +91,22 @@ class CRS_BASELINE_V2:
         self.rerank_topk = rerank_topk
         self.qwen_model_path = qwen_model_path
         
-        # Load LLM
+        # ── Load Qwen model ONCE on CPU (shared by retrieval + reranker) ──────
+        # Running Qwen on CPU avoids occupying GPU memory permanently.
+        # Query encoding is done infrequently enough that CPU speed is acceptable.
+        import logging
+        from transformers import AutoTokenizer, AutoModel
+        _logger = logging.getLogger(__name__)
+        _logger.info("Loading Qwen3-Embedding model on CPU (shared) …")
+        qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
+        qwen_model     = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
+
+        # Load LLM (GPU)
         self.lm = load_lm_module(
             self.lm_type, self.device, self.attn_implementation, self.dtype
         )
-        
-        # Load multi-channel retrieval
+
+        # Load multi-channel retrieval (shares Qwen on CPU)
         self.retrieval = MultiChannelRetrieval(
             dataset_name=self.conversation_dataset_name,
             item_db_name=self.item_db_name,
@@ -107,15 +117,17 @@ class CRS_BASELINE_V2:
             cache_dir=self.cache_dir,
             qwen_model_path=self.qwen_model_path,
             device=self.device,
+            qwen_model=qwen_model,
+            qwen_tokenizer=qwen_tokenizer,
         )
-        
+
         # Load item and user databases
         self.item_db = MusicCatalogDB(
             self.item_db_name, self.track_split_types, self.corpus_types
         )
         self.user_db = UserProfileDB(self.user_db_name, self.user_split_types)
-        
-        # Load three-tower reranker
+
+        # Load three-tower reranker (shares Qwen on CPU)
         self.reranker = ThreeTowerRerankerWrapper(
             dataset_name=self.conversation_dataset_name,
             track_emb_db_name=self.track_emb_db_name,
@@ -127,6 +139,8 @@ class CRS_BASELINE_V2:
             qwen_model_path=self.qwen_model_path,
             device=self.device,
             lr=reranker_lr,
+            qwen_model=qwen_model,
+            qwen_tokenizer=qwen_tokenizer,
         )
         
         # Load prompts
