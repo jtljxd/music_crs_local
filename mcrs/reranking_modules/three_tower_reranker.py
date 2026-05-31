@@ -626,21 +626,87 @@ class ThreeTowerRerankerWrapper:
 
     # ── text encoding ────────────────────────────────────────────────────────
 
+    def set_embedding_cache(self, cache):
+        """Inject a pre-computed QwenEmbeddingCache.
+
+        Once set, _encode_text / _encode_texts_batch will look up embeddings
+        from the cache instead of running Qwen forward pass.
+        """
+        self._qwen_cache = cache
+        logger.info("QwenEmbeddingCache injected into ThreeTowerRerankerWrapper (%d entries).", len(cache))
+
     def _encode_text(self, text: str, max_dim: int = 128) -> torch.Tensor:
-        """Mean-pool Qwen embeddings on CPU; return first max_dim dims."""
+        """Look up from pre-computed cache; fall back to Qwen model."""
+        if not text or not text.strip():
+            return torch.zeros(max_dim)
+
+        # 1. Pre-computed cache
+        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
+            return self._qwen_cache.get(text, dim=max_dim, normalize=True)
+
+        # 2. Per-instance runtime cache
+        cache_key = (text, max_dim)
+        if not hasattr(self, "_encode_cache"):
+            self._encode_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+        if cache_key in self._encode_cache:
+            return self._encode_cache[cache_key]
+
         self.qwen_model.eval()
         with torch.no_grad():
-            inputs  = self.tokenizer(
-                text, return_tensors="pt", padding=True,
-                truncation=True, max_length=512,
-            )
-            # Always run on CPU – Qwen is kept off GPU to save VRAM for the LLM
+            inputs  = self.tokenizer(text, return_tensors="pt", padding=True,
+                                     truncation=True, max_length=512)
             outputs = self.qwen_model(**inputs)
             attn    = inputs["attention_mask"]
             tok_emb = outputs.last_hidden_state
             mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
             emb     = torch.sum(tok_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-            return emb[:, :max_dim].squeeze(0)  # [max_dim] on CPU
+            result  = emb[:, :max_dim].squeeze(0)
+
+        if len(self._encode_cache) >= 8192:
+            self._encode_cache.clear()
+        self._encode_cache[cache_key] = result
+        return result
+
+    def _encode_texts_batch(self, texts: List[str], max_dim: int = 128) -> List[torch.Tensor]:
+        """Batch-encode texts; use pre-computed cache for all hits."""
+        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
+            return self._qwen_cache.get_batch(texts, dim=max_dim, normalize=True)
+
+        # Fall back to runtime cache + on-the-fly encoding
+        if not hasattr(self, "_encode_cache"):
+            self._encode_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+
+        results   = [None] * len(texts)
+        to_encode = []
+        for i, text in enumerate(texts):
+            if not text or not text.strip():
+                results[i] = torch.zeros(max_dim)
+            elif (text, max_dim) in self._encode_cache:
+                results[i] = self._encode_cache[(text, max_dim)]
+            else:
+                to_encode.append((i, text))
+
+        if to_encode:
+            indices, raw_texts = zip(*to_encode)
+            self.qwen_model.eval()
+            with torch.no_grad():
+                inputs  = self.tokenizer(list(raw_texts), return_tensors="pt",
+                                         padding=True, truncation=True, max_length=512)
+                outputs = self.qwen_model(**inputs)
+                attn    = inputs["attention_mask"]
+                tok_emb = outputs.last_hidden_state
+                mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
+                embs    = torch.sum(tok_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+                embs    = embs[:, :max_dim]
+
+            if len(self._encode_cache) >= 8192:
+                self._encode_cache.clear()
+            for j, (orig_idx, text) in enumerate(zip(indices, raw_texts)):
+                vec = embs[j]
+                self._encode_cache[(text, max_dim)] = vec
+                results[orig_idx] = vec
+
+        return results
 
     # ── inference ───────────────────────────────────────────────────────────
 
@@ -660,15 +726,14 @@ class ThreeTowerRerankerWrapper:
         N = len(candidate_track_ids)
         self.model.eval()
         with torch.no_grad():
-            # ── intent features ──────────────────────────────────────────
-            query_emb        = self._encode_text(current_query, 128)
-            history_emb      = self._encode_text(history_context, 128) if history_context else torch.zeros(128)
-            if conversation_goal:
-                listener_goal_emb = self._encode_text(conversation_goal.get("listener_goal", ""), 128)
-                category_emb      = self._encode_text(conversation_goal.get("category", ""), 128)
-            else:
-                listener_goal_emb = torch.zeros(128)
-                category_emb      = torch.zeros(128)
+            # ── intent features: batch-encode all 4 texts in ONE forward pass ──
+            listener_goal = conversation_goal.get("listener_goal", "") if conversation_goal else ""
+            category      = conversation_goal.get("category", "")      if conversation_goal else ""
+
+            encoded = self._encode_texts_batch(
+                [current_query, history_context, listener_goal, category], max_dim=128
+            )
+            query_emb, history_emb, listener_goal_emb, category_emb = encoded
 
             intent_features = (
                 torch.cat([query_emb, history_emb, listener_goal_emb, category_emb])

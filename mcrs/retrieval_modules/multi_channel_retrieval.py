@@ -15,6 +15,7 @@ inference.
 import os
 import json
 import logging
+from functools import lru_cache
 from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 
@@ -365,22 +366,47 @@ class MultiChannelRetrieval:
 
     # ── query encoding ───────────────────────────────────────────────────────
 
+    def set_embedding_cache(self, cache):
+        """Inject a pre-computed QwenEmbeddingCache.
+
+        Once set, _encode_query will look up embeddings from the cache
+        (dim=256, normalised) instead of running Qwen forward pass.
+        """
+        self._qwen_cache = cache
+        logger.info("QwenEmbeddingCache injected into MultiChannelRetrieval (%d entries).", len(cache))
+
     def _encode_query(self, query: str) -> torch.Tensor:
-        """Encode query using Qwen model (always on CPU); return first 256 dims, L2-normalised."""
+        """Encode query; look up pre-computed cache first, fall back to Qwen model."""
+        if not query or not query.strip():
+            return torch.zeros(256)
+
+        # 1. Pre-computed cache (fastest path)
+        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
+            return self._qwen_cache.get(query, dim=256, normalize=True)
+
+        # 2. Per-instance runtime text cache
+        if not hasattr(self, "_encode_cache"):
+            self._encode_cache: Dict[str, torch.Tensor] = {}
+        if query in self._encode_cache:
+            return self._encode_cache[query]
+
         self.qwen_model.eval()
         with torch.no_grad():
-            inputs = self.tokenizer(
+            inputs    = self.tokenizer(
                 query, return_tensors="pt", padding=True,
                 truncation=True, max_length=512,
             )
-            # Always run on CPU – Qwen is kept off GPU to save VRAM for the LLM
-            outputs  = self.qwen_model(**inputs)
+            outputs   = self.qwen_model(**inputs)
             attn_mask = inputs["attention_mask"]
             tok_embs  = outputs.last_hidden_state
             mask      = attn_mask.unsqueeze(-1).expand(tok_embs.size()).float()
             emb       = torch.sum(tok_embs * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-            emb       = emb[:, :256]
-            return F.normalize(emb, p=2, dim=1).squeeze(0)  # [256] on CPU
+            emb       = F.normalize(emb[:, :256], p=2, dim=1).squeeze(0)
+
+        if len(self._encode_cache) >= 8192:
+            self._encode_cache.clear()
+        self._encode_cache[query] = emb
+        return emb
 
     # ── retrieval channels ───────────────────────────────────────────────────
 
