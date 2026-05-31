@@ -382,6 +382,14 @@ class MultiChannelRetrieval:
         self._qwen_cache = cache
         logger.info("QwenEmbeddingCache injected into MultiChannelRetrieval (%d entries).", len(cache))
 
+    # Qwen3-Embedding instruction prefix
+    _QWEN_TASK = "Given a music conversation query, retrieve relevant music tracks"
+
+    @staticmethod
+    def _last_token_pool(last_hidden: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        seq_len = attn_mask.sum(dim=1) - 1
+        return last_hidden[torch.arange(last_hidden.shape[0], device=last_hidden.device), seq_len]
+
     def _encode_query(self, query: str) -> torch.Tensor:
         """Encode query; look up pre-computed cache first, fall back to Qwen model."""
         if not query or not query.strip():
@@ -397,18 +405,17 @@ class MultiChannelRetrieval:
         if query in self._encode_cache:
             return self._encode_cache[query]
 
+        text = f"Instruct: {self._QWEN_TASK}\nQuery: {query}"
         self.qwen_model.eval()
-        with torch.no_grad():
-            inputs    = self.tokenizer(
-                query, return_tensors="pt", padding=True,
+        with torch.inference_mode():
+            inputs = self.tokenizer(
+                text, return_tensors="pt", padding=True,
                 truncation=True, max_length=512,
             )
-            outputs   = self.qwen_model(**inputs)
-            attn_mask = inputs["attention_mask"]
-            tok_embs  = outputs.last_hidden_state
-            mask      = attn_mask.unsqueeze(-1).expand(tok_embs.size()).float()
-            emb       = torch.sum(tok_embs * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-            emb       = F.normalize(emb[:, :256], p=2, dim=1).squeeze(0)
+            outputs = self.qwen_model(**inputs)
+            emb = self._last_token_pool(outputs.last_hidden_state,
+                                        inputs["attention_mask"])  # [1, H]
+            emb = F.normalize(emb[:, :256], p=2, dim=1).squeeze(0).float()
 
         if len(self._encode_cache) >= 8192:
             self._encode_cache.clear()

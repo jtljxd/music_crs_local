@@ -336,7 +336,7 @@ class ThreeTowerReranker(nn.Module):
 
     def __init__(
         self,
-        intent_input_dim: int = 512,
+        intent_input_dim: int = 256,
         tower_output_dim: int = 128,
         item_vocab_sizes: Dict[str, int] = None,
         user_vocab_sizes: Dict[str, int] = None,
@@ -483,9 +483,8 @@ class ThreeTowerRerankerWrapper:
 
         logger.info("Initializing three-tower model …")
         self.model = ThreeTowerReranker(
-            intent_input_dim=512,
+            intent_input_dim=256,   # query(128) + history_avg(128)
             tower_output_dim=128,
-            # Categorical features not fed at inference time yet
             item_vocab_sizes={},
             user_vocab_sizes={},
         ).to(device)
@@ -624,7 +623,38 @@ class ThreeTowerRerankerWrapper:
         }
         return item_vocabs, user_vocabs
 
-    # ── text encoding ────────────────────────────────────────────────────────
+    # Qwen3-Embedding instruction prefix
+    _QWEN_TASK = "Given a music conversation query, retrieve relevant music tracks"
+
+    @staticmethod
+    def _last_token_pool(last_hidden: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        seq_len = attn_mask.sum(dim=1) - 1
+        return last_hidden[torch.arange(last_hidden.shape[0], device=last_hidden.device), seq_len]
+
+    def _encode_text(self, text: str, max_dim: int = 128) -> torch.Tensor:
+        """Fallback: encode a single text via Qwen (last-token pool, fp16 → float32 output)."""
+        if not text or not text.strip():
+            return torch.zeros(max_dim)
+        if not hasattr(self, "_encode_cache"):
+            self._encode_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+        key = (text, max_dim)
+        if key in self._encode_cache:
+            return self._encode_cache[key]
+
+        query = f"Instruct: {self._QWEN_TASK}\nQuery: {text}"
+        self.qwen_model.eval()
+        with torch.inference_mode():
+            inputs  = self.tokenizer(query, return_tensors="pt", padding=True,
+                                     truncation=True, max_length=512)
+            outputs = self.qwen_model(**inputs)
+            emb = self._last_token_pool(outputs.last_hidden_state,
+                                        inputs["attention_mask"])   # [1, H]
+            emb = F.normalize(emb[:, :max_dim], p=2, dim=1).squeeze(0).float()
+
+        if len(self._encode_cache) >= 8192:
+            self._encode_cache.clear()
+        self._encode_cache[key] = emb
+        return emb
 
     def set_turn_store(self, store: dict):
         """Inject a pre-computed turn embedding store.
@@ -680,15 +710,10 @@ class ThreeTowerRerankerWrapper:
                                                   current_query, dim=128)
             history_emb      = self._get_turn_emb(session_id, turn_number, "history_avg",
                                                   history_context, dim=128)
-            listener_goal    = conversation_goal.get("listener_goal", "") if conversation_goal else ""
-            category         = conversation_goal.get("category",      "") if conversation_goal else ""
-            listener_goal_emb = self._encode_text(listener_goal, max_dim=128)
-            category_emb      = self._encode_text(category,      max_dim=128)
-
             intent_features = (
-                torch.cat([query_emb, history_emb, listener_goal_emb, category_emb])
+                torch.cat([query_emb, history_emb])
                 .unsqueeze(0).repeat(N, 1).to(self.device)
-            )  # [N, 512]
+            )  # [N, 256]
 
             # ── user features + cf_bpr_missing mask ──────────────────────
             if user_id and user_id in self.user_embeddings:

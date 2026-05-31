@@ -1,39 +1,45 @@
 """
 Pre-compute per-turn Qwen embeddings for every conversation in the dataset.
 
-Storage schema (saved as a single .pt / JSON file)
-----------------------------------------------------
-Key format:   "{session_id}__{turn}_{role}"
-              role: "user" | "system" | "history_avg"
+Storage schema (saved as a single .pt file)
+--------------------------------------------
+Key format:  "{session_id}__{turn}_{role}"
+             role: "user" | "system" | "history_avg"
 
-  {session_id}__1_user          → emb of the 1st user query      [128]
-  {session_id}__1_system        → emb of the 1st system reply     [128]
-  {session_id}__2_user          → emb of the 2nd user query       [128]
-  {session_id}__2_system        → emb of the 2nd system reply     [128]
+  {session_id}__1_user         → emb of 1st user query        [128] fp16
+  {session_id}__1_system       → emb of 1st system reply       [128] fp16
+  {session_id}__2_user         → emb of 2nd user query         [128] fp16
+  {session_id}__2_system       → emb of 2nd system reply       [128] fp16
   ...
-  {session_id}__n_history_avg   → avg-pool of turns 1..(n-1) user+system embs  [128]
+  {session_id}__n_history_avg  → avg-pool of turns 1..(n-1)   [128] fp16
 
-All values are float16 tensors of shape [128] (first 128 dims of Qwen output).
+Processing modes
+----------------
+Default (--sessions_per_chunk N):
+  Load N sessions at a time, encode immediately, save checkpoint.
+  Low peak RAM, works well for large train splits.
 
 Usage
 -----
+# train split, stream 8 sessions at a time (low memory)
 python precompute_turn_embeddings.py \
-    --dataset talkpl-ai/TalkPlayData-Challenge-Dataset \
-    --split   test \
-    --qwen    /home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B \
-    --out     cache/turn_embeddings.pt \
-    --batch   128
+    --split   train \
+    --out     cache/turn_embeddings_train.pt \
+    --batch   256 \
+    --sessions_per_chunk 8
 
-The output file can then be loaded with:
-    store = torch.load("cache/turn_embeddings.pt", map_location="cpu")
-    emb   = store["{session_id}__3_history_avg"]   # shape [128]
+# test split (small, can do all at once)
+python precompute_turn_embeddings.py \
+    --split   test \
+    --out     cache/turn_embeddings_test.pt \
+    --batch   256
 """
 
 import os
 import argparse
 import logging
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -48,70 +54,142 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TARGET_DIM = 128        # store only first 128 dims
-STORE_DIM  = 1024       # full Qwen hidden size (pad/truncate to this before slicing)
+TARGET_DIM = 128
+
+# Qwen3-Embedding instruction prefix for query encoding
+QWEN_TASK = "Given a music conversation query, retrieve relevant music tracks"
 
 
-# ── model loader ──────────────────────────────────────────────────────────────
+def _get_instruct(text: str) -> str:
+    return f"Instruct: {QWEN_TASK}\nQuery: {text}"
+
+
+# ── model ─────────────────────────────────────────────────────────────────────
 
 def load_qwen(model_path: str, device: str = "cuda"):
-    logger.info("Loading Qwen tokenizer + model from %s (device=%s) …", model_path, device)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model     = AutoModel.from_pretrained(model_path).to(device).eval()
-    logger.info("Qwen loaded on %s.", device)
+    logger.info("Loading Qwen from %s (device=%s) …", model_path, device)
+    dtype     = torch.float16 if device == "cuda" else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=True, local_files_only=True,
+    )
+    model = AutoModel.from_pretrained(
+        model_path, trust_remote_code=True, local_files_only=True,
+        torch_dtype=dtype,
+    ).to(device).eval()
+    logger.info("Qwen ready on %s (dtype=%s).", device, dtype)
     return tokenizer, model
 
 
-# ── batch encode ──────────────────────────────────────────────────────────────
+def _last_token_pool(last_hidden: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    """Qwen3-Embedding uses the last non-padding token as the sentence embedding."""
+    seq_len = attn_mask.sum(dim=1) - 1              # [B]
+    batch   = last_hidden.shape[0]
+    return last_hidden[torch.arange(batch, device=last_hidden.device), seq_len]
 
-def encode_batch(
+
+def encode_texts(
     texts: List[str],
     tokenizer,
     model,
-    batch_size: int = 128,
+    device: str,
+    batch_size: int = 256,
+    add_instruct: bool = True,
 ) -> torch.Tensor:
-    """Encode a list of texts; returns float16 [N, TARGET_DIM] on CPU."""
+    """Encode texts with Qwen3-Embedding; returns float16 CPU tensor [N, TARGET_DIM].
+
+    Uses last-token pooling + L2 normalisation (matches Qwen3 official usage).
+    """
+    if add_instruct:
+        texts = [_get_instruct(t) for t in texts]
+
     all_embs = []
     for start in range(0, len(texts), batch_size):
         chunk = texts[start: start + batch_size]
-        with torch.no_grad():
-            inputs  = tokenizer(
-                chunk, return_tensors="pt", padding=True,
-                truncation=True, max_length=512,
-            )
+        inputs = tokenizer(chunk, return_tensors="pt", padding=True,
+                           truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.inference_mode():
             outputs = model(**inputs)
-            attn    = inputs["attention_mask"]
-            tok_emb = outputs.last_hidden_state          # [B, T, H]
-            mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
-            emb     = (
-                torch.sum(tok_emb * mask, dim=1)
-                / torch.clamp(mask.sum(dim=1), min=1e-9)
-            )                                            # [B, H]
-            emb = emb[:, :TARGET_DIM]                    # [B, 128]
-        all_embs.append(emb.half())                      # store fp16
-    return torch.cat(all_embs, dim=0)                    # [N, 128]
+            emb     = _last_token_pool(outputs.last_hidden_state,
+                                       inputs["attention_mask"])  # [B, H]
+            emb     = F.normalize(emb, p=2, dim=1)
+            all_embs.append(emb[:, :TARGET_DIM].cpu().half())
+    return torch.cat(all_embs, dim=0)  # [N, TARGET_DIM] fp16
 
 
 # ── dataset helpers ───────────────────────────────────────────────────────────
 
 def extract_turns(session: dict) -> List[Tuple[int, str, str]]:
-    """Return list of (turn_number, role, content) for a session.
-
-    role is normalised to 'user' or 'system'.
-    'music' turns are kept with role='system' (they represent assistant replies).
-    """
+    """(turn_number, role, content); role normalised to 'user'/'system'."""
     turns = []
     for conv in session["conversations"]:
         role    = conv["role"]
-        content = str(conv.get("content", "") or "")
-        if not content.strip():
+        content = str(conv.get("content", "") or "").strip()
+        if not content:
             continue
         if role in ("assistant", "music"):
             role = "system"
-        turns.append((conv["turn_number"], role, content))
-    # Sort by turn_number
+        turns.append((int(conv["turn_number"]), role, content))
     turns.sort(key=lambda x: x[0])
     return turns
+
+
+def process_sessions(
+    sessions: List[dict],
+    store: Dict[str, torch.Tensor],
+    tokenizer,
+    model,
+    device: str,
+    batch_size: int,
+) -> int:
+    """Encode all turns in a list of sessions, update store in-place.
+
+    Returns number of NEW entries added.
+    """
+    # Collect unique texts not yet in store
+    text_to_keys: Dict[str, List[str]] = defaultdict(list)
+    session_turns_map: Dict[str, List[Tuple[int, str, str]]] = {}
+
+    for session in sessions:
+        sid   = session["session_id"]
+        turns = extract_turns(session)
+        session_turns_map[sid] = turns
+        for turn_num, role, text in turns:
+            key = f"{sid}__{turn_num}_{role}"
+            if key not in store:
+                text_to_keys[text].append(key)
+
+    unique_texts = list(text_to_keys.keys())
+
+    # Encode new texts
+    if unique_texts:
+        embs = encode_texts(unique_texts, tokenizer, model, device, batch_size)
+        for i, text in enumerate(unique_texts):
+            vec = embs[i]
+            for key in text_to_keys[text]:
+                store[key] = vec
+
+    # Build history_avg for each session
+    for sid, turns in session_turns_map.items():
+        ordered = [(t, r) for t, r, _ in turns]
+        for idx, (turn_num, role) in enumerate(ordered):
+            if role != "user":
+                continue
+            avg_key = f"{sid}__{turn_num}_history_avg"
+            if avg_key in store:
+                continue
+            source_keys = [
+                f"{sid}__{t}_{r}"
+                for t, r in ordered[:idx]
+                if f"{sid}__{t}_{r}" in store
+            ]
+            if not source_keys:
+                store[avg_key] = torch.zeros(TARGET_DIM, dtype=torch.float16)
+            else:
+                vecs = torch.stack([store[k].float() for k in source_keys])
+                store[avg_key] = vecs.mean(dim=0).half()
+
+    return len(unique_texts)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -120,121 +198,61 @@ def main(args):
     out_path = args.out
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
 
-    # Load existing store so we can resume / extend
+    # Resume from existing store
     if os.path.exists(out_path):
-        logger.info("Loading existing store from %s …", out_path)
+        logger.info("Resuming from %s …", out_path)
         store: Dict[str, torch.Tensor] = torch.load(out_path, map_location="cpu")
         logger.info("  %d entries already cached.", len(store))
     else:
         store = {}
 
-    # Load dataset
-    logger.info("Loading dataset %s (split=%s) …", args.dataset, args.split)
-    ds = load_dataset(args.dataset, split=args.split)
-    logger.info("  %d sessions.", len(ds))
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Using device: %s", device)
 
-    # ── Pass 1: collect all individual turn texts that need encoding ──────────
-    # We will encode each unique text exactly once, then build derived keys.
+    tokenizer, model = load_qwen(args.qwen, device)
 
-    # Maps text → list of (key, is_individual) so we can fill the store after encoding.
-    text_to_keys: Dict[str, List[str]] = defaultdict(list)
-    # session_id → ordered list of (turn_num, role, text) for history-avg computation
-    session_turns: Dict[str, List[Tuple[int, str, str]]] = {}
+    # Handle "all" split → process train + validation + test
+    splits = ["train", "validation", "test"] if args.split == "all" else [args.split]
 
-    for session in tqdm(ds, desc="Collecting texts"):
-        session_id = session["session_id"]
-        turns      = extract_turns(session)
-        session_turns[session_id] = turns
+    for split in splits:
+        logger.info("=" * 60)
+        logger.info("Processing split: %s", split)
+        ds = load_dataset(args.dataset, split=split)
+        total_sessions = len(ds)
+        logger.info("  %d sessions total.", total_sessions)
 
-        for turn_num, role, text in turns:
-            key = f"{session_id}__{turn_num}_{role}"
-            if key not in store:
-                text_to_keys[text].append(key)
+        chunk_size = args.sessions_per_chunk
+        save_every = args.save_every   # save every N sessions
 
-    unique_texts = list(text_to_keys.keys())
-    logger.info("%d unique individual turn texts to encode.", len(unique_texts))
+        added_total = 0
+        pbar = tqdm(range(0, total_sessions, chunk_size),
+                    desc=f"{split}", unit="chunk")
 
-    # ── Encode individual turns (skip already in store) ───────────────────────
-    if unique_texts:
-        tokenizer, model = load_qwen(args.qwen, device=args.device)
-        device = next(model.parameters()).device
-        logger.info("Encoding %d texts (batch_size=%d, device=%s) …",
-                    len(unique_texts), args.batch, device)
+        for chunk_start in pbar:
+            chunk = [ds[i] for i in range(chunk_start,
+                                           min(chunk_start + chunk_size, total_sessions))]
+            added = process_sessions(chunk, store, tokenizer, model, device, args.batch)
+            added_total += added
+            pbar.set_postfix(store_size=len(store), new=added)
 
-        for start in tqdm(range(0, len(unique_texts), args.batch), desc="Encoding turns"):
-            chunk = unique_texts[start: start + args.batch]
-            with torch.no_grad():
-                inputs  = tokenizer(
-                    chunk, return_tensors="pt", padding=True,
-                    truncation=True, max_length=512,
-                )
-                inputs  = {k: v.to(device) for k, v in inputs.items()}
-                outputs = model(**inputs)
-                attn    = inputs["attention_mask"]
-                tok_emb = outputs.last_hidden_state
-                mask    = attn.unsqueeze(-1).expand(tok_emb.size()).float()
-                emb     = (
-                    torch.sum(tok_emb * mask, dim=1)
-                    / torch.clamp(mask.sum(dim=1), min=1e-9)
-                )[:, :TARGET_DIM].cpu().half()   # [B, 128] fp16 on CPU
-
-            for i, text in enumerate(chunk):
-                vec = emb[i]
-                for key in text_to_keys[text]:
-                    store[key] = vec
-
-            # Periodic save every 10k entries added
-            if (start // args.batch) % 100 == 0 and start > 0:
+            # Periodic save
+            if (chunk_start // chunk_size + 1) % (save_every // chunk_size + 1) == 0:
                 torch.save(store, out_path)
-                logger.info("  Checkpoint saved (%d entries).", len(store))
 
-        logger.info("Individual turn encoding complete. %d entries in store.", len(store))
+        # Save after each split
         torch.save(store, out_path)
+        logger.info("Split %s done. Added %d new entries. Store total: %d",
+                    split, added_total, len(store))
 
-    # ── Pass 2: build history_avg keys ────────────────────────────────────────
-    # For the n-th turn query, history_avg = avg-pool of all user+system embs
-    # from turns 1 … (n-1).
+    logger.info("=" * 60)
+    logger.info("All done. Final store: %d entries → %s", len(store), out_path)
 
-    logger.info("Building history_avg embeddings …")
-    avg_todo = []   # (key, list_of_source_keys)
-
-    for session_id, turns in session_turns.items():
-        # Collect (turn_num, role) pairs in order
-        ordered = [(t, r) for t, r, _ in turns]
-
-        for idx, (turn_num, role) in enumerate(ordered):
-            if role != "user":
-                continue   # only generate history_avg for user turns
-            avg_key = f"{session_id}__{turn_num}_history_avg"
-            if avg_key in store:
-                continue   # already computed
-
-            # Source: all individual turn keys BEFORE this turn (turns 1..n-1)
-            source_keys = [
-                f"{session_id}__{t}_{r}"
-                for t, r in ordered[:idx]
-                if f"{session_id}__{t}_{r}" in store
-            ]
-
-            if not source_keys:
-                # Turn 1 has no history → zero vector
-                store[avg_key] = torch.zeros(TARGET_DIM, dtype=torch.float16)
-            else:
-                avg_todo.append((avg_key, source_keys))
-
-    logger.info("  %d history_avg keys to compute.", len(avg_todo))
-    for avg_key, source_keys in tqdm(avg_todo, desc="Building history_avg"):
-        vecs = torch.stack([store[k].float() for k in source_keys])  # [M, 128]
-        avg  = vecs.mean(dim=0).half()                                # [128] fp16
-        store[avg_key] = avg
-
-    torch.save(store, out_path)
-    logger.info("Done. Final store: %d entries → %s", len(store), out_path)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    example_keys = list(store.keys())[:6]
-    logger.info("Example keys: %s", example_keys)
-    logger.info("Value shape:  %s  dtype: %s", store[example_keys[0]].shape, store[example_keys[0]].dtype)
+    # Quick sanity check
+    example_keys = list(store.keys())[:4]
+    for k in example_keys:
+        logger.info("  %s  →  shape=%s dtype=%s", k, store[k].shape, store[k].dtype)
 
 
 if __name__ == "__main__":
@@ -242,32 +260,38 @@ if __name__ == "__main__":
         description="Pre-compute per-turn Qwen embeddings for all conversations."
     )
     parser.add_argument(
-        "--device", type=str,
-        default="cuda" if __import__("torch").cuda.is_available() else "cpu",
-        help="Device for Qwen encoding (cuda recommended for speed)",
-    )
-    parser.add_argument(
         "--dataset", type=str,
         default="talkpl-ai/TalkPlayData-Challenge-Dataset",
-        help="HuggingFace dataset name",
     )
     parser.add_argument(
-        "--split", type=str, default="test",
-        help="Dataset split to process (e.g. 'test', 'train', 'all')",
+        "--split", type=str, default="train",
+        help="Split to process: train / test / validation / all",
     )
     parser.add_argument(
         "--qwen", type=str,
         default="/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
-        help="Path to Qwen3-Embedding-0.6B model",
     )
     parser.add_argument(
         "--out", type=str,
         default="cache/turn_embeddings.pt",
-        help="Output .pt file path",
+        help="Output .pt file (shared across splits if you use --split all)",
     )
     parser.add_argument(
-        "--batch", type=int, default=128,
-        help="Qwen encoding batch size",
+        "--batch", type=int, default=256,
+        help="Qwen encoding batch size per GPU forward pass",
+    )
+    parser.add_argument(
+        "--sessions_per_chunk", type=int, default=8,
+        help="Number of sessions to load and encode at once "
+             "(lower = less peak RAM, same speed on GPU)",
+    )
+    parser.add_argument(
+        "--save_every", type=int, default=1000,
+        help="Save checkpoint every N sessions processed",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="cuda / cpu / auto (default: auto-detect)",
     )
     args = parser.parse_args()
     main(args)
