@@ -54,11 +54,11 @@ STORE_DIM  = 1024       # full Qwen hidden size (pad/truncate to this before sli
 
 # ── model loader ──────────────────────────────────────────────────────────────
 
-def load_qwen(model_path: str):
-    logger.info("Loading Qwen tokenizer + model from %s …", model_path)
+def load_qwen(model_path: str, device: str = "cuda"):
+    logger.info("Loading Qwen tokenizer + model from %s (device=%s) …", model_path, device)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model     = AutoModel.from_pretrained(model_path).cpu().eval()
-    logger.info("Qwen loaded.")
+    model     = AutoModel.from_pretrained(model_path).to(device).eval()
+    logger.info("Qwen loaded on %s.", device)
     return tokenizer, model
 
 
@@ -156,8 +156,10 @@ def main(args):
 
     # ── Encode individual turns (skip already in store) ───────────────────────
     if unique_texts:
-        tokenizer, model = load_qwen(args.qwen)
-        logger.info("Encoding %d texts (batch_size=%d) …", len(unique_texts), args.batch)
+        tokenizer, model = load_qwen(args.qwen, device=args.device)
+        device = next(model.parameters()).device
+        logger.info("Encoding %d texts (batch_size=%d, device=%s) …",
+                    len(unique_texts), args.batch, device)
 
         for start in tqdm(range(0, len(unique_texts), args.batch), desc="Encoding turns"):
             chunk = unique_texts[start: start + args.batch]
@@ -166,6 +168,7 @@ def main(args):
                     chunk, return_tensors="pt", padding=True,
                     truncation=True, max_length=512,
                 )
+                inputs  = {k: v.to(device) for k, v in inputs.items()}
                 outputs = model(**inputs)
                 attn    = inputs["attention_mask"]
                 tok_emb = outputs.last_hidden_state
@@ -173,7 +176,7 @@ def main(args):
                 emb     = (
                     torch.sum(tok_emb * mask, dim=1)
                     / torch.clamp(mask.sum(dim=1), min=1e-9)
-                )[:, :TARGET_DIM].half()   # [B, 128] fp16
+                )[:, :TARGET_DIM].cpu().half()   # [B, 128] fp16 on CPU
 
             for i, text in enumerate(chunk):
                 vec = emb[i]
@@ -237,6 +240,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Pre-compute per-turn Qwen embeddings for all conversations."
+    )
+    parser.add_argument(
+        "--device", type=str,
+        default="cuda" if __import__("torch").cuda.is_available() else "cpu",
+        help="Device for Qwen encoding (cuda recommended for speed)",
     )
     parser.add_argument(
         "--dataset", type=str,
