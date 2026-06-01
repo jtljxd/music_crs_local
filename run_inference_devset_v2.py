@@ -42,9 +42,6 @@ def chat_history_parser(conversations, music_crs, target_turn_number):
 
 
 def main(args):
-    print("Removing cache directory for preventing memory issues...")
-    os.system("rm -rf cache")
-
     config           = OmegaConf.load(f"config/{args.tid}.yaml")
     pipeline_version = config.get("pipeline_version", "v1")
     qwen_model_path  = config.get(
@@ -52,6 +49,18 @@ def main(args):
         "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
     )
     cache_dir = config.cache_dir
+
+    # Remove runtime cache (indices, FM checkpoints etc.) but preserve
+    # precomputed turn embeddings so they don't need to be regenerated.
+    print("Cleaning runtime cache ...")
+    import shutil
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+        print(f"  Removed {cache_dir}.")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Turn embedding store lives in qwen/ (outside cache/), never gets wiped
+    turn_store_path = os.path.join("qwen", "turn_embeddings.pt")
 
     # ── Load the CRS pipeline ─────────────────────────────────────────────
     if pipeline_version == "v2":

@@ -213,8 +213,8 @@ def main(args):
 
     tokenizer, model = load_qwen(args.qwen, device)
 
-    # Handle "all" split → process train + validation + test
-    splits = ["train", "validation", "test"] if args.split == "all" else [args.split]
+    # Handle "all" split → process train + test (no validation split in this dataset)
+    splits = ["train", "test"] if args.split == "all" else [args.split]
 
     for split in splits:
         logger.info("=" * 60)
@@ -274,7 +274,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--out", type=str,
-        default="cache/turn_embeddings.pt",
+        default="qwen/turn_embeddings.pt",
         help="Output .pt file (shared across splits if you use --split all)",
     )
     parser.add_argument(
