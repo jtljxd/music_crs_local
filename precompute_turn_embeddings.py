@@ -229,7 +229,7 @@ def main(args):
     # Resume from existing store
     if os.path.exists(out_path):
         logger.info("Resuming from %s …", out_path)
-        store: Dict[str, torch.Tensor] = torch.load(out_path, map_location="cpu")
+        store: Dict[str, torch.Tensor] = torch.load(out_path, map_location="cpu", weights_only=True)
         logger.info("  %d entries already cached.", len(store))
     else:
         store = {}

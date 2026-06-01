@@ -146,19 +146,27 @@ def main(args):
 
     # ── Load / build turn-embedding store (V2 only) ───────────────────────
     if pipeline_version == "v2":
-        turn_store_path = os.path.join(cache_dir, "turn_embeddings.pt")
+        # Map dataset name → pre-computed turn embedding file under qwen/
+        _TURN_STORE_MAP = {
+            "talkpl-ai/TalkPlayData-Challenge-Dataset":      "qwen/turn_embeddings.pt",         # train
+            "talkpl-ai/TalkPlayData-Challenge-Dataset:test": "qwen/turn_embeddings_test.pt",    # test split
+            "talkpl-ai/TalkPlayData-Challenge-Blind-A":      "qwen/turn_embeddings_blindA.pt",
+        }
+        test_ds_name = config.get("test_dataset_name", "talkpl-ai/TalkPlayData-Challenge-Dataset")
+        # The devset uses split="test" of the main dataset → use test store
+        _split_key = f"{test_ds_name}:test" if test_ds_name == "talkpl-ai/TalkPlayData-Challenge-Dataset" else test_ds_name
+        turn_store_path = _TURN_STORE_MAP.get(_split_key, f"qwen/turn_embeddings.pt")
 
         if not os.path.exists(turn_store_path):
             print(f"Turn embedding store not found at {turn_store_path}.")
-            print("Run first:  python precompute_turn_embeddings.py "
-                  f"--out {turn_store_path} --split test")
+            print(f"Run:  python precompute_turn_embeddings.py --dataset {test_ds_name} --split test --out {turn_store_path}")
             raise FileNotFoundError(
                 f"Missing pre-computed turn embeddings: {turn_store_path}\n"
                 "Please run precompute_turn_embeddings.py before inference."
             )
 
         print(f"Loading turn embedding store from {turn_store_path} …")
-        turn_store = torch.load(turn_store_path, map_location="cpu")
+        turn_store = torch.load(turn_store_path, map_location="cpu", weights_only=True)
         print(f"  {len(turn_store)} entries loaded.")
         music_crs.set_turn_store(turn_store)
 

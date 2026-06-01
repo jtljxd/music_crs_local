@@ -1,0 +1,25 @@
+lm_type: "/home/lijiatong06/music-crs-baselines/Llama-3.2-1B-Instruct"
+pipeline_version: "v2"
+conversation_dataset_name: "talkpl-ai/TalkPlayData-Challenge-Dataset"
+test_dataset_name: "talkpl-ai/TalkPlayData-Challenge-Blind-A"
+item_db_name: "talkpl-ai/TalkPlayData-Challenge-Track-Metadata"
+user_db_name: "talkpl-ai/TalkPlayData-Challenge-User-Metadata"
+track_emb_db_name: "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"
+user_emb_db_name: "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"
+track_split_types:
+  - "all_tracks"
+user_split_types:
+  - "all_users"
+corpus_types:
+  - "track_name"
+  - "artist_name"
+  - "album_name"
+  - "tag_list"
+  - "release_date"
+cache_dir: "./cache"
+qwen_model_path: "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B"
+device: "cuda"
+attn_implementation: "sdpa"
+retrieval_topk: 350
+rerank_topk: 20
+reranker_lr: 0.001
