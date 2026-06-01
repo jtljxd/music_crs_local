@@ -459,7 +459,9 @@ class ThreeTowerRerankerWrapper:
         self.cache_dir       = cache_dir
         self.qwen_model_path = qwen_model_path
 
-        self.model_dir = os.path.join(cache_dir, "three_tower_reranker")
+        # Store checkpoint under qwen/ (sibling of turn store) so it survives
+        # cache wipes in inference scripts.
+        self.model_dir = os.path.join("qwen", "three_tower_reranker")
         os.makedirs(self.model_dir, exist_ok=True)
 
         logger.info("Loading datasets …")
