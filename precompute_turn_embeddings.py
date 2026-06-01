@@ -97,23 +97,51 @@ def encode_texts(
 ) -> torch.Tensor:
     """Encode texts with Qwen3-Embedding; returns float16 CPU tensor [N, TARGET_DIM].
 
-    Uses last-token pooling + L2 normalisation (matches Qwen3 official usage).
+    Automatically halves batch_size on OOM and retries (down to batch_size=1).
     """
     if add_instruct:
         texts = [_get_instruct(t) for t in texts]
 
     all_embs = []
-    for start in range(0, len(texts), batch_size):
-        chunk = texts[start: start + batch_size]
-        inputs = tokenizer(chunk, return_tensors="pt", padding=True,
-                           truncation=True, max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.inference_mode():
-            outputs = model(**inputs)
-            emb     = _last_token_pool(outputs.last_hidden_state,
-                                       inputs["attention_mask"])  # [B, H]
-            emb     = F.normalize(emb, p=2, dim=1)
-            all_embs.append(emb[:, :TARGET_DIM].cpu().half())
+    start = 0
+    current_batch = batch_size
+
+    while start < len(texts):
+        chunk = texts[start: start + current_batch]
+        try:
+            inputs = tokenizer(chunk, return_tensors="pt", padding=True,
+                               truncation=True, max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                outputs = model(**inputs)
+                emb     = _last_token_pool(outputs.last_hidden_state,
+                                           inputs["attention_mask"])
+                emb     = F.normalize(emb, p=2, dim=1)
+                all_embs.append(emb[:, :TARGET_DIM].cpu().half())
+            start += current_batch
+            # Recover batch size after success (up to original)
+            current_batch = min(current_batch * 2, batch_size)
+        except torch.cuda.OutOfMemoryError:
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            if current_batch <= 1:
+                # Last resort: fall back to CPU for this single sample
+                logger.warning("OOM even at batch_size=1; falling back to CPU for this chunk.")
+                inputs = tokenizer(chunk, return_tensors="pt", padding=True,
+                                   truncation=True, max_length=512)
+                cpu_model = model.cpu()
+                with torch.inference_mode():
+                    outputs = cpu_model(**inputs)
+                    emb     = _last_token_pool(outputs.last_hidden_state,
+                                               inputs["attention_mask"])
+                    emb     = F.normalize(emb, p=2, dim=1)
+                    all_embs.append(emb[:, :TARGET_DIM].half())
+                model.to(device)
+                start += current_batch
+            else:
+                current_batch = max(1, current_batch // 2)
+                logger.warning("OOM — reducing batch_size to %d and retrying.", current_batch)
+
     return torch.cat(all_embs, dim=0)  # [N, TARGET_DIM] fp16
 
 
