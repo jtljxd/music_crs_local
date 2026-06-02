@@ -1,42 +1,32 @@
 """
-Three-Tower Reranker Training Script
-=====================================
-Constructs training samples from TalkPlayData-Challenge-Dataset:
+Three-Tower Reranker Training Script (v2)
+==========================================
 
+Sample construction:
   For each (session, turn_n):
-    - query_emb      = turn store lookup  {session_id}__{n}_user       [128]
-    - history_emb    = turn store lookup  {session_id}__{n}_history_avg [128]
-    - intent_features = cat([query_emb, history_emb])                   [256]
+    Positive: ALL tracks that appear in conversations (any turn) → label = 1.0
+    Hard negatives (in-batch): 5 tracks from DIFFERENT session_ids in the same batch
+    Super-hard negatives (in-recall): 5 tracks randomly sampled from retrieval candidates
+      (BM25 + Qwen channel results, excluding the positive)
+    Easy negatives: 10 tracks randomly sampled from the full track pool
 
-  Label assignment (from goal_progress_assessments):
-    - MOVES_TOWARD_GOAL      → 1.0  (positive)
-    - DOES_NOT_MOVE_TOWARD_GOAL → 0.3 (weak positive / soft label)
-
-  Per-batch negatives:
-    - 1 hard negative: the track recommended in a DIFFERENT session's
-      same-indexed turn (in-batch hard neg)
-    - 3 easy negatives: randomly sampled from all tracks              → label 0
-
-Loss: weighted BCEWithLogitsLoss over all (positive + negative) samples in the batch.
+Loss: BCEWithLogitsLoss over all rows in the batch.
 
 Usage:
     python train_three_tower.py \
         --config config/llama1b_multi_channel_devset.yaml \
-        --epochs 3 \
-        --batch_size 64 \
-        --lr 1e-3 \
-        --checkpoint_dir qwen/three_tower_ckpt
-
-    # checkpoint is also saved to cache/three_tower_reranker/model.pt (inference path)
+        --epochs 10 \
+        --batch_size 32 \
+        --lr 1e-3
 """
 
 import argparse
 import logging
 import os
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
-import pandas as pd
+import bm25s
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -57,6 +47,29 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  BM25 helper (lightweight, no BERT for recall during training)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_bm25(cache_dir: str) -> Tuple[Optional[object], Optional[List[str]]]:
+    """Load pre-built BM25 index from multi_channel_retrieval cache."""
+    bm25_dir = os.path.join(cache_dir, "multi_channel_retrieval", "bm25_index")
+    ids_path = os.path.join(bm25_dir, "track_ids.json")
+    if not os.path.exists(ids_path):
+        return None, None
+    import json
+    model = bm25s.BM25.load(bm25_dir, load_corpus=True)
+    with open(ids_path) as f:
+        track_ids = json.load(f)
+    return model, track_ids
+
+
+def bm25_recall(model, track_ids: List[str], query: str, topk: int = 50) -> List[str]:
+    tokens  = bm25s.tokenize([query.lower()])
+    results = model.retrieve(tokens, k=min(topk, len(track_ids)), return_as="tuple")
+    return [track_ids[item["id"]] for item in results.documents[0]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Data preparation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -65,50 +78,35 @@ def build_training_samples(
     turn_store: Dict[str, torch.Tensor],
 ) -> List[Dict]:
     """
-    Returns a list of sample dicts, one per (session, turn):
-    {
-        session_id, turn_number, user_id,
-        track_id,          # the recommended track at this turn
-        label,             # 1.0 or 0.3
-        query_emb,         # [128] float32
-        history_emb,       # [128] float32
-    }
+    Returns a list of sample dicts, one per (session, turn).
+    All tracks appearing in conversations are positives (label=1.0).
     """
     logger.info("Loading conversation dataset …")
     ds = load_dataset(dataset_name, split="train")
 
-    # goal_progress_assessments is a list of dicts per item;
-    # keyed by turn_number (str) or int
     samples = []
     skipped = 0
 
     for item in tqdm(ds, desc="Building samples", unit="session"):
         session_id = item["session_id"]
         user_id    = item.get("user_id", None)
-        convs      = item["conversations"]          # list of {turn_number, role, content}
-        goals      = item.get("goal_progress_assessments", [])  # list of {turn_number, ...}
+        convs      = item["conversations"]
 
-        # Build turn→label map from goal_progress_assessments
-        goal_map: Dict[int, str] = {}
-        for g in (goals or []):
-            tn  = int(g.get("turn_number", -1))
-            val = g.get("goal_progress", g.get("assessment", ""))
-            goal_map[tn] = val
-
-        # Build turn→track_id map (role == "music")
+        # Collect ALL music tracks in this session → all are positives
         music_turns: Dict[int, str] = {}
         for c in convs:
-            if c.get("role") == "music":
+            if c.get("role") == "music" and c.get("content"):
                 music_turns[int(c["turn_number"])] = c["content"]
 
-        for turn_number, track_id in music_turns.items():
-            if not track_id:
-                skipped += 1
-                continue
+        if not music_turns:
+            continue
 
-            # Look up embeddings
-            q_key   = f"{session_id}__{turn_number}_user"
-            h_key   = f"{session_id}__{turn_number}_history_avg"
+        # Collect all positive track ids in this session (for super-hard neg pool)
+        session_positive_ids: Set[str] = set(music_turns.values())
+
+        for turn_number, track_id in music_turns.items():
+            q_key = f"{session_id}__{turn_number}_user"
+            h_key = f"{session_id}__{turn_number}_history_avg"
             if q_key not in turn_store:
                 skipped += 1
                 continue
@@ -120,34 +118,30 @@ def build_training_samples(
                 else torch.zeros_like(query_emb)
             )
 
-            # Determine label
-            assessment = goal_map.get(turn_number, "")
-            if "MOVES_TOWARD_GOAL" in assessment:
-                label = 1.0
-            elif "DOES_NOT_MOVE_TOWARD_GOAL" in assessment:
-                label = 0.3
-            else:
-                # No assessment available – treat as positive (system recommended)
-                label = 1.0
+            # user_query text (for BM25 recall)
+            user_query = ""
+            for c in convs:
+                if int(c["turn_number"]) == turn_number and c["role"] == "user":
+                    user_query = c.get("content", "")
+                    break
 
             samples.append({
-                "session_id":   session_id,
-                "turn_number":  turn_number,
-                "user_id":      user_id,
-                "track_id":     track_id,
-                "label":        label,
-                "query_emb":    query_emb,      # [128]
-                "history_emb":  history_emb,    # [128]
+                "session_id":            session_id,
+                "turn_number":           turn_number,
+                "user_id":               user_id,
+                "track_id":              track_id,
+                "session_positive_ids":  session_positive_ids,
+                "user_query":            user_query,
+                "query_emb":             query_emb,
+                "history_emb":           history_emb,
             })
 
-    logger.info(
-        "Built %d training samples (skipped %d).", len(samples), skipped
-    )
+    logger.info("Built %d training samples (skipped %d).", len(samples), skipped)
     return samples
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Feature building helpers (mirrors ThreeTowerRerankerWrapper.rerank())
+#  Feature building (mirrors ThreeTowerRerankerWrapper)
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRACK_MODAL_COLS = ThreeTowerRerankerWrapper.TRACK_MODAL_COLS
@@ -155,15 +149,10 @@ TRACK_DIM        = ThreeTowerRerankerWrapper.TRACK_MODAL_TARGET_DIM
 USER_DIM         = ThreeTowerRerankerWrapper.USER_CF_BPR_TARGET_DIM
 
 
-def _raw_to_tensor(value, dim: int) -> Tuple[torch.Tensor, bool]:
-    return ThreeTowerRerankerWrapper._raw_to_tensor(value, dim)
-
-
 def build_track_features(
     track_id: str,
     track_embeddings: Dict,
 ) -> Tuple[List[torch.Tensor], List[bool]]:
-    """Returns (modal_embs [6×dim], missing_flags [6])."""
     if track_id in track_embeddings:
         embs    = track_embeddings[track_id]
         missing = set(embs["__missing__"])
@@ -171,8 +160,7 @@ def build_track_features(
         embs    = {}
         missing = set(TRACK_MODAL_COLS)
 
-    modal_embs    = []
-    missing_flags = []
+    modal_embs, missing_flags = [], []
     for col in TRACK_MODAL_COLS:
         if col in missing or col not in embs:
             modal_embs.append(torch.zeros(TRACK_DIM))
@@ -183,11 +171,7 @@ def build_track_features(
     return modal_embs, missing_flags
 
 
-def build_user_features(
-    user_id: Optional[str],
-    user_embeddings: Dict,
-) -> Tuple[torch.Tensor, bool]:
-    """Returns (cf_bpr [128], is_missing)."""
+def build_user_features(user_id, user_embeddings) -> Tuple[torch.Tensor, bool]:
     if user_id and user_id in user_embeddings:
         data = user_embeddings[user_id]
         return data["cf-bpr"], ("cf-bpr" in data["__missing__"])
@@ -204,15 +188,18 @@ def collate_batch(
     track_embeddings: Dict,
     user_embeddings: Dict,
     device: str,
+    bm25_model=None,
+    bm25_track_ids: Optional[List[str]] = None,
+    num_hard_neg: int = 5,
+    num_recall_neg: int = 5,
+    num_easy_neg: int = 10,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     """
-    For each sample in the mini-batch:
-      - 1 positive/soft-positive (label from dataset)
-      - 1 hard negative: track from a different session in the same batch
-      - 3 easy negatives: random tracks from all_track_ids
-
-    Returns (model_inputs, labels) where model_inputs is a flat batch of
-    len(samples) * 5 rows.
+    For each sample:
+      1 positive (label=1.0)
+      num_hard_neg   in-batch hard negatives (diff session_id)
+      num_recall_neg super-hard negatives (from BM25 recall, excl. positives)
+      num_easy_neg   easy negatives (random from all tracks)
     """
     rows_intent     = []
     rows_modal      = [[] for _ in TRACK_MODAL_COLS]
@@ -221,44 +208,55 @@ def collate_batch(
     rows_cf_missing = []
     labels          = []
 
-    # Collect the tracks recommended in this mini-batch (for hard negatives)
-    batch_track_ids = [s["track_id"] for s in samples]
+    batch_session_ids = [s["session_id"] for s in samples]
+    batch_track_ids   = [s["track_id"]   for s in samples]
+
+    def _add_row(s: Dict, track_id: str, lbl: float):
+        intent  = torch.cat([s["query_emb"], s["history_emb"]])
+        u_bpr, u_miss = build_user_features(s["user_id"], user_embeddings)
+        me, mf = build_track_features(track_id, track_embeddings)
+
+        rows_intent.append(intent)
+        for j, emb in enumerate(me):
+            rows_modal[j].append(emb)
+        rows_modal_mask.append(mf)
+        rows_user_bpr.append(u_bpr)
+        rows_cf_missing.append(u_miss)
+        labels.append(lbl)
 
     for i, s in enumerate(samples):
-        intent = torch.cat([s["query_emb"], s["history_emb"]])   # [256]
-        u_bpr, u_miss = build_user_features(s["user_id"], user_embeddings)
+        # ── positive ──────────────────────────────────────────────────────
+        _add_row(s, s["track_id"], 1.0)
 
-        def _add_row(track_id: str, lbl: float):
-            modal_embs, miss_flags = build_track_features(track_id, track_embeddings)
-            rows_intent.append(intent)
-            for j, me in enumerate(modal_embs):
-                rows_modal[j].append(me)
-            rows_modal_mask.append(miss_flags)
-            rows_user_bpr.append(u_bpr)
-            rows_cf_missing.append(u_miss)
-            labels.append(lbl)
+        # ── in-batch hard negatives (different session) ────────────────────
+        diff_indices = [
+            j for j, sid in enumerate(batch_session_ids) if sid != s["session_id"]
+        ]
+        hard_picks = random.sample(
+            diff_indices, min(num_hard_neg, len(diff_indices))
+        ) if diff_indices else []
+        for j in hard_picks:
+            _add_row(s, batch_track_ids[j], 0.0)
 
-        # Positive / soft-positive
-        _add_row(s["track_id"], s["label"])
-
-        # Hard negative: pick a track from another sample in this batch
-        hard_neg_idx = (i + 1 + random.randint(0, len(samples) - 2)) % len(samples)
-        hard_neg_tid = batch_track_ids[hard_neg_idx]
-        if hard_neg_tid != s["track_id"]:
-            _add_row(hard_neg_tid, 0.0)
+        # ── super-hard negatives from recall ──────────────────────────────
+        if bm25_model is not None and s["user_query"]:
+            recall = bm25_recall(bm25_model, bm25_track_ids, s["user_query"], topk=50)
+            # Exclude all session positives
+            recall = [tid for tid in recall if tid not in s["session_positive_ids"]]
         else:
-            _add_row(random.choice(all_track_ids), 0.0)
+            recall = []
+        recall_picks = random.sample(recall, min(num_recall_neg, len(recall))) if recall else []
+        for tid in recall_picks:
+            _add_row(s, tid, 0.0)
 
-        # 3 easy negatives
-        for _ in range(3):
-            easy_neg = random.choice(all_track_ids)
-            _add_row(easy_neg, 0.0)
+        # ── easy negatives (random) ────────────────────────────────────────
+        for _ in range(num_easy_neg):
+            easy_tid = random.choice(all_track_ids)
+            _add_row(s, easy_tid, 0.0)
 
-    # Stack everything
-    intent_tensor  = torch.stack(rows_intent).to(device)          # [B*5, 256]
-    modal_tensors  = [
-        torch.stack(rows_modal[j]).to(device) for j in range(len(TRACK_MODAL_COLS))
-    ]                                                               # 6 × [B*5, 128]
+    # Stack tensors
+    intent_tensor  = torch.stack(rows_intent).to(device)
+    modal_tensors  = [torch.stack(rows_modal[j]).to(device) for j in range(len(TRACK_MODAL_COLS))]
     modal_mask     = torch.tensor(rows_modal_mask, dtype=torch.bool, device=device)
     user_bpr       = torch.stack(rows_user_bpr).to(device)
     cf_missing     = torch.tensor(rows_cf_missing, dtype=torch.bool, device=device)
@@ -281,44 +279,38 @@ def collate_batch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
-    config          = OmegaConf.load(f"config/{args.config}" if not args.config.endswith(".yaml")
-                                      else args.config)
-    device          = config.get("device", "cuda") if args.device is None else args.device
+    config = OmegaConf.load(args.config)
+    device = args.device or config.get("device", "cuda")
     cache_dir       = config.get("cache_dir", "./cache")
     qwen_model_path = config.get(
         "qwen_model_path",
         "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
     )
+    dataset_name = config.get(
+        "conversation_dataset_name", "talkpl-ai/TalkPlayData-Challenge-Dataset"
+    )
 
     # ── Load turn store ──────────────────────────────────────────────────────
-    turn_store_path = args.turn_store
-    logger.info("Loading turn store from %s …", turn_store_path)
+    logger.info("Loading turn store from %s …", args.turn_store)
     turn_store: Dict[str, torch.Tensor] = torch.load(
-        turn_store_path, map_location="cpu", weights_only=True
+        args.turn_store, map_location="cpu", weights_only=True
     )
     logger.info("  %d entries loaded.", len(turn_store))
 
     # ── Build training samples ───────────────────────────────────────────────
-    dataset_name = config.get(
-        "conversation_dataset_name", "talkpl-ai/TalkPlayData-Challenge-Dataset"
-    )
     samples = build_training_samples(dataset_name, turn_store)
     if not samples:
-        logger.error("No training samples built. Check turn store path and dataset.")
+        logger.error("No training samples built.")
         return
 
-    # ── Load reranker wrapper (track/user embeddings + vocab) ────────────────
-    logger.info("Loading ThreeTowerRerankerWrapper for feature lookup …")
+    # ── Load reranker wrapper ────────────────────────────────────────────────
+    logger.info("Initializing ThreeTowerRerankerWrapper …")
     wrapper = ThreeTowerRerankerWrapper(
-        dataset_name          = dataset_name,
-        track_emb_db_name     = config.get(
-            "track_emb_db_name",
-            "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings",
-        ),
-        user_emb_db_name      = config.get(
-            "user_emb_db_name",
-            "talkpl-ai/TalkPlayData-Challenge-User-Embeddings",
-        ),
+        dataset_name           = dataset_name,
+        track_emb_db_name      = config.get("track_emb_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"),
+        user_emb_db_name       = config.get("user_emb_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"),
         track_metadata_db_name = config.get("item_db_name",
             "talkpl-ai/TalkPlayData-Challenge-Track-Metadata"),
         user_metadata_db_name  = config.get("user_db_name",
@@ -330,43 +322,49 @@ def train(args):
         lr            = args.lr,
     )
 
-    model       = wrapper.model
-    optimizer   = wrapper.optimizer
-    track_embs  = wrapper.track_embeddings
-    user_embs   = wrapper.user_embeddings
-    all_tids    = list(track_embs.keys())
+    model      = wrapper.model
+    optimizer  = wrapper.optimizer
+    track_embs = wrapper.track_embeddings
+    user_embs  = wrapper.user_embeddings
+    all_tids   = list(track_embs.keys())
 
-    # Loss: weighted BCE
+    # ── Load BM25 for super-hard negatives ───────────────────────────────────
+    bm25_model, bm25_tids = load_bm25(cache_dir)
+    if bm25_model is None:
+        logger.warning(
+            "BM25 index not found in %s; super-hard negatives will be skipped.\n"
+            "Run inference once first to build the BM25 index, then retrain.",
+            cache_dir,
+        )
+
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
     checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    logger.info("Starting training: %d samples, %d epochs, batch=%d",
-                len(samples), args.epochs, args.batch_size)
+    logger.info("Training: %d samples, %d epochs, batch=%d", len(samples), args.epochs, args.batch_size)
 
     global_step = 0
     for epoch in range(1, args.epochs + 1):
         random.shuffle(samples)
         model.train()
-        epoch_loss   = 0.0
-        epoch_steps  = 0
+        epoch_loss  = 0.0
+        epoch_steps = 0
 
-        pbar = tqdm(
-            range(0, len(samples), args.batch_size),
-            desc=f"Epoch {epoch}/{args.epochs}",
-            unit="batch",
-        )
+        pbar = tqdm(range(0, len(samples), args.batch_size),
+                    desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         for batch_start in pbar:
             batch_samples = samples[batch_start: batch_start + args.batch_size]
             if not batch_samples:
                 continue
 
             model_inputs, label_tensor = collate_batch(
-                batch_samples, all_tids, track_embs, user_embs, device
+                batch_samples, all_tids, track_embs, user_embs, device,
+                bm25_model=bm25_model, bm25_track_ids=bm25_tids,
+                num_hard_neg=5, num_recall_neg=5, num_easy_neg=10,
             )
 
-            scores = model(**model_inputs)          # [B*5]
+            scores = model(**model_inputs)
             loss   = loss_fn(scores, label_tensor)
 
             optimizer.zero_grad()
@@ -377,26 +375,20 @@ def train(args):
             epoch_loss  += loss.item()
             epoch_steps += 1
             global_step += 1
-
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
             if global_step % args.save_every == 0:
                 wrapper.save_checkpoint()
-                _extra = os.path.join(checkpoint_dir, f"model_step{global_step}.pt")
-                torch.save({"model_state_dict": model.state_dict()}, _extra)
                 logger.info("Step %d: checkpoint saved.", global_step)
 
         avg_loss = epoch_loss / max(epoch_steps, 1)
         logger.info("Epoch %d done. avg_loss=%.4f", epoch, avg_loss)
-
-        # Save end-of-epoch checkpoint
         wrapper.save_checkpoint()
         ep_path = os.path.join(checkpoint_dir, f"model_epoch{epoch}.pt")
         torch.save({"model_state_dict": model.state_dict()}, ep_path)
         logger.info("Epoch %d checkpoint → %s", epoch, ep_path)
 
-    logger.info("Training complete. Final checkpoint at %s/model.pt",
-                os.path.join(cache_dir, "three_tower_reranker"))
+    logger.info("Training complete. Model saved to qwen/three_tower_reranker/model.pt")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,33 +396,15 @@ def train(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Three-Tower Reranker")
-    p.add_argument(
-        "--config", type=str,
-        default="config/llama1b_multi_channel_devset.yaml",
-        help="Path to OmegaConf yaml config",
-    )
-    p.add_argument(
-        "--turn_store", type=str,
-        default="qwen/turn_embeddings.pt",
-        help="Pre-computed turn embedding store (train split)",
-    )
-    p.add_argument("--epochs",     type=int,   default=3)
-    p.add_argument("--batch_size", type=int,   default=64)
-    p.add_argument("--lr",         type=float, default=1e-3)
-    p.add_argument(
-        "--checkpoint_dir", type=str,
-        default="qwen/three_tower_ckpt",
-        help="Directory for per-epoch/step checkpoints",
-    )
-    p.add_argument(
-        "--save_every", type=int, default=500,
-        help="Save checkpoint every N steps",
-    )
-    p.add_argument(
-        "--device", type=str, default=None,
-        help="Override device (default: from config yaml)",
-    )
+    p = argparse.ArgumentParser(description="Train Three-Tower Reranker v2")
+    p.add_argument("--config",      type=str,   default="config/llama1b_multi_channel_devset.yaml")
+    p.add_argument("--turn_store",  type=str,   default="qwen/turn_embeddings.pt")
+    p.add_argument("--epochs",      type=int,   default=10)
+    p.add_argument("--batch_size",  type=int,   default=32)
+    p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--checkpoint_dir", type=str, default="qwen/three_tower_ckpt")
+    p.add_argument("--save_every",  type=int,   default=500)
+    p.add_argument("--device",      type=str,   default=None)
     return p.parse_args()
 
 

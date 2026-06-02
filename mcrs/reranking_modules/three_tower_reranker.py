@@ -331,8 +331,69 @@ class UserTower(nn.Module):
         return self.mlp(user_features)
 
 
+class FMLayer(nn.Module):
+    """Factorization Machine second-order interaction layer.
+
+    Computes pairwise feature interactions via:
+        FM = 0.5 * sum((sum_i v_i * x_i)^2 - sum_i (v_i * x_i)^2)
+
+    Input: [batch, input_dim]  (all features concatenated)
+    Output: scalar per sample [batch]
+    """
+
+    def __init__(self, input_dim: int, factor_dim: int = 16):
+        super().__init__()
+        self.V = nn.Parameter(torch.randn(input_dim, factor_dim) * 0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [batch, factor_dim]
+        square_of_sum = (x @ self.V) ** 2          # (sum x_i * v_i)^2
+        sum_of_square = (x ** 2) @ (self.V ** 2)   # sum (x_i * v_i)^2
+        return 0.5 * (square_of_sum - sum_of_square).sum(dim=1, keepdim=True)  # [batch, 1]
+
+
+class DCNLayer(nn.Module):
+    """Deep & Cross Network cross layer.
+
+    x_l+1 = x_0 * (x_l^T * w_l) + b_l + x_l
+    """
+
+    def __init__(self, input_dim: int, num_cross_layers: int = 3):
+        super().__init__()
+        self.weights = nn.ParameterList(
+            [nn.Parameter(torch.randn(input_dim, 1) * 0.01) for _ in range(num_cross_layers)]
+        )
+        self.biases = nn.ParameterList(
+            [nn.Parameter(torch.zeros(input_dim)) for _ in range(num_cross_layers)]
+        )
+        self.num_layers = num_cross_layers
+
+    def forward(self, x0: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x0: [batch, input_dim]
+        Returns:
+            [batch, input_dim]
+        """
+        xl = x0
+        for i in range(self.num_layers):
+            # scalar: x_l^T * w_l  →  [batch, 1]
+            scalar = xl @ self.weights[i]          # [batch, 1]
+            xl = x0 * scalar + self.biases[i] + xl
+        return xl
+
+
 class ThreeTowerReranker(nn.Module):
-    """Three-tower reranking model with missing-mask support."""
+    """Three-tower reranking model with FM second-order + DCN cross interactions.
+
+    Architecture:
+        1. Three towers → intent_repr [128], item_repr [128], user_repr [128]
+        2. concat → all_features [384]
+        3. FM Layer (second-order pairwise) → fm_out [1]
+        4. DCN cross layers → cross_out [384]
+        5. Deep MLP on cross_out → deep_out [64]
+        6. Final: sigmoid(fm_out + deep_out linear → 1)
+    """
 
     def __init__(
         self,
@@ -340,6 +401,8 @@ class ThreeTowerReranker(nn.Module):
         tower_output_dim: int = 128,
         item_vocab_sizes: Dict[str, int] = None,
         user_vocab_sizes: Dict[str, int] = None,
+        fm_factor_dim: int = 16,
+        num_cross_layers: int = 3,
     ):
         super().__init__()
 
@@ -363,18 +426,29 @@ class ThreeTowerReranker(nn.Module):
             vocab_sizes=user_vocab_sizes,
         )
 
-        final_input_dim = tower_output_dim * 3
-        self.final_mlp = nn.Sequential(
-            nn.Linear(final_input_dim, 128),
+        concat_dim = tower_output_dim * 3  # 384
+
+        # FM second-order interactions over the concatenated tower outputs
+        self.fm_layer = FMLayer(input_dim=concat_dim, factor_dim=fm_factor_dim)
+
+        # DCN cross layers
+        self.dcn_layer = DCNLayer(input_dim=concat_dim, num_cross_layers=num_cross_layers)
+
+        # Deep branch on top of DCN output
+        self.deep_mlp = nn.Sequential(
+            nn.Linear(concat_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(64, 1),
         )
+
+        # Learnable weight to combine FM and deep outputs
+        self.fm_weight = nn.Parameter(torch.ones(1))
 
     def forward(
         self,
@@ -389,27 +463,38 @@ class ThreeTowerReranker(nn.Module):
         """
         Args:
             intent_features:    [batch, intent_input_dim]
-            modal_embs:         List of 6 × [batch, 128]  (zero-filled where absent)
+            modal_embs:         List of 6 × [batch, 128]
             item_categorical:   Dict of item categorical features
-            user_cf_bpr:        [batch, 128]               (zero-filled where absent)
+            user_cf_bpr:        [batch, 128]
             user_categorical:   Dict of user categorical features
-            modal_missing_mask: [batch, 6] bool  – True = modality absent
-            cf_bpr_missing:     [batch] bool      – True = user cf-bpr absent
+            modal_missing_mask: [batch, 6] bool
+            cf_bpr_missing:     [batch] bool
         Returns:
             [batch] predicted scores
         """
-        intent_repr = self.intent_tower(intent_features)
+        intent_repr = self.intent_tower(intent_features)             # [B, 128]
         item_repr   = self.item_tower(
             intent_repr, modal_embs, item_categorical,
             modal_missing_mask=modal_missing_mask,
-        )
+        )                                                             # [B, 128]
         user_repr   = self.user_tower(
             user_cf_bpr, user_categorical,
             cf_bpr_missing=cf_bpr_missing,
-        )
+        )                                                             # [B, 128]
 
+        # Concat all tower outputs → [B, 384]
         combined = torch.cat([intent_repr, item_repr, user_repr], dim=1)
-        return self.final_mlp(combined).squeeze(-1)
+
+        # FM second-order  → [B, 1]
+        fm_out   = self.fm_layer(combined)                           # [B, 1]
+
+        # DCN cross + deep → [B, 1]
+        cross_out = self.dcn_layer(combined)                         # [B, 384]
+        deep_out  = self.deep_mlp(cross_out)                         # [B, 1]
+
+        # Weighted sum then squeeze to [B]
+        score = (self.fm_weight * fm_out + deep_out).squeeze(-1)
+        return score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -489,6 +574,8 @@ class ThreeTowerRerankerWrapper:
             tower_output_dim=128,
             item_vocab_sizes={},
             user_vocab_sizes={},
+            fm_factor_dim=16,
+            num_cross_layers=3,
         ).to(device)
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)

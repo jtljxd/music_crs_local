@@ -3,8 +3,10 @@
 This module implements a comprehensive retrieval strategy combining:
 1. User CF-BPR embedding similarity (user-music tower)
 2. Collaborative filtering based on similar users' liked music
-3. Query-metadata semantic similarity
-4. Query-attributes semantic similarity
+3. Query-metadata semantic similarity (Qwen3)
+4. Query-attributes semantic similarity (Qwen3)
+5. BM25 text matching
+6. BERT semantic embedding matching
 
 Missing / empty embeddings are stored as zero-vectors of the expected dimension
 so that every track/user remains in the index.  The reranker layer uses
@@ -19,6 +21,7 @@ from functools import lru_cache
 from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 
+import bm25s
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset, concatenate_datasets
@@ -32,6 +35,8 @@ USER_HISTORY_LIKE_MUSIC_NUM  = 5
 USER_MUSIC_TOWER_RECALL_NUM  = 100
 QUERY_METADATA_RECALL_NUM    = 100
 QUERY_ATTRIBUTES_RECALL_NUM  = 100
+BM25_RECALL_NUM              = 100
+BERT_RECALL_NUM              = 100
 
 # canonical embedding dimensions (filled in after the first valid row is seen)
 _TRACK_MODAL_COLS = [
@@ -99,6 +104,21 @@ class MultiChannelRetrieval:
 
         logger.info("Building track embedding indices …")
         self._build_track_indices()
+
+        # ── BM25 index (Channel 5) ────────────────────────────────────────
+        logger.info("Building BM25 index …")
+        self._build_bm25_index()
+
+        # ── BERT index (Channel 6) ────────────────────────────────────────
+        logger.info("Building BERT embedding index …")
+        _bert_model_name = "bert-base-uncased"
+        self._bert_tokenizer = AutoTokenizer.from_pretrained(
+            _bert_model_name, use_fast=True
+        )
+        self._bert_model = AutoModel.from_pretrained(_bert_model_name).eval()
+        self._bert_device = device
+        self._bert_model.to(self._bert_device)
+        self._build_bert_index()
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -472,11 +492,114 @@ class MultiChannelRetrieval:
         return [self.track_ids_list[i] for i in top_idx]
 
     def _retrieve_query_attributes(self, query_emb: torch.Tensor, topk: int) -> List[str]:
-        """Channel 4: query × attributes-qwen3 (256 dims)."""
+        """Channel 4: query × attributes-qwen3 (128 dims)."""
         scores  = torch.matmul(self.track_attributes_matrix, query_emb.unsqueeze(1)).squeeze(1)
         topk    = min(topk, scores.shape[0])
         top_idx = torch.topk(scores, k=topk).indices.tolist()
         return [self.track_ids_list[i] for i in top_idx]
+
+    # ── BM25 helpers (Channel 5) ─────────────────────────────────────────────
+
+    def _stringify_metadata(self, track_id: str) -> str:
+        """Convert track metadata to BM25 text."""
+        meta = self.track_metadata_dict.get(track_id, {})
+        parts = []
+        for field in ["track_name", "artist_name", "album_name", "tag_list", "release_date"]:
+            val = meta.get(field, "")
+            if isinstance(val, list):
+                val = " ".join(str(v) for v in val)
+            if val:
+                parts.append(str(val))
+        return " ".join(parts)
+
+    def _build_bm25_index(self):
+        bm25_dir  = os.path.join(self.index_dir, "bm25_index")
+        ids_path  = os.path.join(bm25_dir, "track_ids.json")
+        if os.path.exists(ids_path):
+            logger.info("Loading cached BM25 index …")
+            self._bm25_model = bm25s.BM25.load(bm25_dir, load_corpus=True)
+            with open(ids_path) as f:
+                self._bm25_track_ids = json.load(f)
+            logger.info("  BM25 index loaded (%d tracks).", len(self._bm25_track_ids))
+            return
+        os.makedirs(bm25_dir, exist_ok=True)
+        track_ids = list(self.track_metadata_dict.keys())
+        corpus    = [self._stringify_metadata(tid) for tid in track_ids]
+        tokens    = bm25s.tokenize(corpus)
+        model     = bm25s.BM25()
+        model.index(tokens)
+        model.save(bm25_dir, corpus=corpus)
+        with open(ids_path, "w") as f:
+            json.dump(track_ids, f)
+        self._bm25_model     = bm25s.BM25.load(bm25_dir, load_corpus=True)
+        self._bm25_track_ids = track_ids
+        logger.info("BM25 index built (%d tracks).", len(track_ids))
+
+    def _retrieve_bm25(self, query: str, topk: int) -> List[str]:
+        """Channel 5: BM25 text matching."""
+        tokens = bm25s.tokenize([query.lower()])
+        results = self._bm25_model.retrieve(tokens, k=min(topk, len(self._bm25_track_ids)),
+                                            return_as="tuple")
+        return [self._bm25_track_ids[item["id"]] for item in results.documents[0]]
+
+    # ── BERT helpers (Channel 6) ─────────────────────────────────────────────
+
+    def _build_bert_index(self):
+        bert_dir    = os.path.join(self.index_dir, "bert_index")
+        emb_path    = os.path.join(bert_dir, "embeddings.pt")
+        ids_path    = os.path.join(bert_dir, "track_ids.json")
+        if os.path.exists(emb_path) and os.path.exists(ids_path):
+            logger.info("Loading cached BERT index …")
+            self._bert_matrix    = torch.load(emb_path, map_location="cpu",
+                                               weights_only=True)
+            with open(ids_path) as f:
+                self._bert_track_ids = json.load(f)
+            logger.info("  BERT index loaded (%d tracks).", len(self._bert_track_ids))
+            return
+        os.makedirs(bert_dir, exist_ok=True)
+        track_ids = list(self.track_metadata_dict.keys())
+        texts     = [self._stringify_metadata(tid) for tid in track_ids]
+        all_embs  = []
+        bs = 64
+        self._bert_model.eval()
+        with torch.no_grad():
+            for start in range(0, len(texts), bs):
+                batch  = texts[start: start + bs]
+                inputs = self._bert_tokenizer(batch, padding=True, truncation=True,
+                                              max_length=128, return_tensors="pt")
+                inputs = {k: v.to(self._bert_device) for k, v in inputs.items()}
+                out    = self._bert_model(**inputs)
+                mask   = inputs["attention_mask"].unsqueeze(-1).float()
+                pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                pooled = F.normalize(pooled, p=2, dim=1)
+                all_embs.append(pooled.cpu())
+        self._bert_matrix    = torch.cat(all_embs, dim=0)   # [N, 768]
+        self._bert_track_ids = track_ids
+        torch.save(self._bert_matrix, emb_path)
+        with open(ids_path, "w") as f:
+            json.dump(track_ids, f)
+        logger.info("BERT index built (%d tracks).", len(track_ids))
+
+    def _encode_query_bert(self, query: str) -> torch.Tensor:
+        """Encode a single query with BERT → [768] normalised."""
+        self._bert_model.eval()
+        with torch.no_grad():
+            inputs = self._bert_tokenizer(query, return_tensors="pt", truncation=True,
+                                          max_length=128, padding=True)
+            inputs = {k: v.to(self._bert_device) for k, v in inputs.items()}
+            out    = self._bert_model(**inputs)
+            mask   = inputs["attention_mask"].unsqueeze(-1).float()
+            pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            pooled = F.normalize(pooled, p=2, dim=1).squeeze(0)
+        return pooled.cpu()
+
+    def _retrieve_bert(self, query: str, topk: int) -> List[str]:
+        """Channel 6: BERT cosine similarity."""
+        q_emb  = self._encode_query_bert(query)                      # [768]
+        scores = torch.matmul(self._bert_matrix, q_emb.unsqueeze(1)).squeeze(1)
+        topk   = min(topk, scores.shape[0])
+        top_idx = torch.topk(scores, k=topk).indices.tolist()
+        return [self._bert_track_ids[i] for i in top_idx]
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -528,10 +651,12 @@ class MultiChannelRetrieval:
         ch2 = self._retrieve_similar_users_music(user_id)
         ch3 = self._retrieve_query_metadata(query_emb, QUERY_METADATA_RECALL_NUM)
         ch4 = self._retrieve_query_attributes(query_emb, QUERY_ATTRIBUTES_RECALL_NUM)
+        ch5 = self._retrieve_bm25(current_query, BM25_RECALL_NUM)
+        ch6 = self._retrieve_bert(current_query, BERT_RECALL_NUM)
 
         seen: Set[str] = set()
         result: List[str] = []
-        for tid in ch1 + ch2 + ch3 + ch4:
+        for tid in ch1 + ch2 + ch3 + ch4 + ch5 + ch6:
             if tid not in seen:
                 result.append(tid)
                 seen.add(tid)
