@@ -1,0 +1,35 @@
+# Core ML
+torch==2.2.0+cu118
+torchvision==0.17.0+cu118
+torchaudio==2.2.0+cu118
+
+# Transformers / Tokenizers
+# transformers 4.51.3 是目前能用 torch 2.2.0+cu118 跑 Qwen3-Embedding-8B 的最低版本
+# 不要升级到 4.52+（依赖 torch 2.3+ 的 uintx 特性）
+# 不要安装 torchao（会导致 Int4WeightOnlyConfig 导入失败）
+transformers==4.51.3
+tokenizers==0.21.4
+safetensors==0.7.0
+accelerate==0.26.0
+
+# Dataset / Hub
+datasets==2.21.0
+huggingface_hub==0.36.2
+
+# Numeric / IO
+numpy==1.26.4
+pyarrow==18.1.0
+
+# Utils
+tqdm==4.67.3
+requests==2.34.2
+charset-normalizer==3.4.7
+urllib3==2.7.0
+filelock==3.29.0
+packaging==26.2
+regex==2026.4.4
+fsspec==2026.4.0
+dill==0.3.8
+multiprocess==0.70.16
+xxhash==3.7.0
+aiohttp==3.11.14
