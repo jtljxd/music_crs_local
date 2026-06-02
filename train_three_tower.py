@@ -50,16 +50,49 @@ logger = logging.getLogger(__name__)
 #  BM25 helper (lightweight, no BERT for recall during training)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_bm25(cache_dir: str) -> Tuple[Optional[object], Optional[List[str]]]:
-    """Load pre-built BM25 index from multi_channel_retrieval cache."""
+def load_or_build_bm25(
+    cache_dir: str,
+    track_metadata_dict: Dict,
+) -> Tuple[object, List[str]]:
+    """Load BM25 index from cache, or build it from track_metadata_dict."""
+    import json
     bm25_dir = os.path.join(cache_dir, "multi_channel_retrieval", "bm25_index")
     ids_path = os.path.join(bm25_dir, "track_ids.json")
-    if not os.path.exists(ids_path):
-        return None, None
-    import json
+
+    if os.path.exists(ids_path):
+        logger.info("Loading cached BM25 index from %s …", bm25_dir)
+        model = bm25s.BM25.load(bm25_dir, load_corpus=True)
+        with open(ids_path) as f:
+            track_ids = json.load(f)
+        logger.info("  BM25 index loaded (%d tracks).", len(track_ids))
+        return model, track_ids
+
+    logger.info("BM25 index not found. Building from track metadata …")
+    os.makedirs(bm25_dir, exist_ok=True)
+
+    track_ids = list(track_metadata_dict.keys())
+    corpus = []
+    for tid in track_ids:
+        meta  = track_metadata_dict[tid]
+        parts = []
+        for field in ["track_name", "artist_name", "album_name", "tag_list", "release_date"]:
+            val = meta.get(field, "")
+            if isinstance(val, list):
+                val = " ".join(str(v) for v in val)
+            if val:
+                parts.append(str(val))
+        corpus.append(" ".join(parts))
+
+    tokens  = bm25s.tokenize(corpus)
+    model   = bm25s.BM25()
+    model.index(tokens)
+    model.save(bm25_dir, corpus=corpus)
+    with open(ids_path, "w") as f:
+        json.dump(track_ids, f)
+
+    logger.info("BM25 index built and saved (%d tracks).", len(track_ids))
+    # reload from disk (bm25s requires this to enable .retrieve)
     model = bm25s.BM25.load(bm25_dir, load_corpus=True)
-    with open(ids_path) as f:
-        track_ids = json.load(f)
     return model, track_ids
 
 
@@ -328,14 +361,8 @@ def train(args):
     user_embs  = wrapper.user_embeddings
     all_tids   = list(track_embs.keys())
 
-    # ── Load BM25 for super-hard negatives ───────────────────────────────────
-    bm25_model, bm25_tids = load_bm25(cache_dir)
-    if bm25_model is None:
-        logger.warning(
-            "BM25 index not found in %s; super-hard negatives will be skipped.\n"
-            "Run inference once first to build the BM25 index, then retrain.",
-            cache_dir,
-        )
+    # ── Load/Build BM25 for super-hard negatives ─────────────────────────────
+    bm25_model, bm25_tids = load_or_build_bm25(cache_dir, wrapper.track_metadata)
 
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
