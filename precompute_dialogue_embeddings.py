@@ -35,7 +35,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel
 
-TARGET_DIM = 4096  # Qwen3-Embedding-8B hidden_size
+TARGET_DIM = 4096  # default, overridden by --target_dim arg
 QWEN_TASK = "Given a music conversation query, retrieve relevant music tracks"
 
 
@@ -203,6 +203,8 @@ def process_sessions(
 
 def run_worker(args):
     """单卡模式：处理 [rank, world_size) 的 session 分片。"""
+    global TARGET_DIM
+    TARGET_DIM = args.target_dim
     logger = get_logger(f"gpu{args.rank}")
     device = "cuda:0"  # 每个子进程通过 CUDA_VISIBLE_DEVICES 只看到一张卡，固定用 cuda:0
 
@@ -262,6 +264,7 @@ def run_split(split: str, args):
             "--out_dir", args.out_dir,
             "--batch", str(args.batch),
             "--sessions_per_chunk", str(args.sessions_per_chunk),
+            "--target_dim", str(args.target_dim),
             "--rank", str(rank),
             "--world_size", str(num_gpus),
         ]
@@ -310,10 +313,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--sessions_per_chunk", type=int, default=8)
     parser.add_argument("--num_gpus", type=int, default=8)
+    parser.add_argument("--target_dim", type=int, default=4096)
     # worker 专用参数（子进程内部使用）
     parser.add_argument("--rank", type=int, default=-1)
     parser.add_argument("--world_size", type=int, default=1)
     args = parser.parse_args()
+
+    TARGET_DIM = args.target_dim
 
     if args.rank >= 0:
         # 子进程模式：直接跑 worker
