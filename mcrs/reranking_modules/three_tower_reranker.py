@@ -383,32 +383,61 @@ class DCNLayer(nn.Module):
         return xl
 
 
+class PPNetGate(nn.Module):
+    """PPNet (Parameter Personalized Net) Gate.
+
+    Uses a personalized query vector (gate_input) to generate element-wise
+    gates that modulate the DNN hidden states:
+        gate = sigmoid(W_gate * gate_input)
+        output = hidden * gate
+
+    Reference: PPNet (Personalized Parameter Network), KDD 2022.
+    """
+
+    def __init__(self, gate_input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(gate_input_dim, hidden_dim, bias=False)
+
+    def forward(self, gate_input: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            gate_input: [batch, gate_input_dim]  – query embedding used as gate
+            hidden:     [batch, hidden_dim]
+        Returns:
+            [batch, hidden_dim] gated hidden
+        """
+        gate = torch.sigmoid(self.gate_proj(gate_input))
+        return hidden * gate
+
+
 class ThreeTowerReranker(nn.Module):
-    """Three-tower reranking model with FM second-order + DCN cross interactions.
+    """Three-tower reranking model with DCN + PPNet-DNN architecture.
 
     Architecture:
         1. Three towers → intent_repr [128], item_repr [128], user_repr [128]
         2. concat → all_features [384]
-        3. FM Layer (second-order pairwise) → fm_out [1]
-        4. DCN cross layers → cross_out [384]
-        5. Deep MLP on cross_out → deep_out [64]
-        6. Final: sigmoid(fm_out + deep_out linear → 1)
+        3. Branch A – DCN (3 cross layers) → cross_out [384]
+        4. Branch B – PPNet-DNN: each layer output is gated by query_emb [1024]
+             DNN: 384 → 1024 → 512 → 128 → 32
+             PPNet gate at each hidden layer using query_emb as gate input
+        5. concat(cross_out, ppnet_out) → [384+32=416]
+        6. Final MLP [1024, 512, 128, 32, 1] → score
     """
 
     def __init__(
         self,
-        intent_input_dim: int = 256,
+        intent_input_dim: int = 2048,   # query(1024) + history(1024)
         tower_output_dim: int = 128,
+        query_gate_dim: int = 1024,     # query emb dim for PPNet gate
         item_vocab_sizes: Dict[str, int] = None,
         user_vocab_sizes: Dict[str, int] = None,
-        fm_factor_dim: int = 16,
         num_cross_layers: int = 3,
     ):
         super().__init__()
 
         self.intent_tower = IntentTower(
             input_dim=intent_input_dim,
-            hidden_dim=256,
+            hidden_dim=512,
             output_dim=tower_output_dim,
         )
         self.item_tower = ItemTower(
@@ -426,29 +455,34 @@ class ThreeTowerReranker(nn.Module):
             vocab_sizes=user_vocab_sizes,
         )
 
-        concat_dim = tower_output_dim * 3  # 384
+        concat_dim = tower_output_dim * 3   # 384
 
-        # FM second-order interactions over the concatenated tower outputs
-        self.fm_layer = FMLayer(input_dim=concat_dim, factor_dim=fm_factor_dim)
-
-        # DCN cross layers
+        # Branch A: DCN cross layers
         self.dcn_layer = DCNLayer(input_dim=concat_dim, num_cross_layers=num_cross_layers)
 
-        # Deep branch on top of DCN output
-        self.deep_mlp = nn.Sequential(
-            nn.Linear(concat_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        # Branch B: PPNet-DNN
+        # Layer dims: 384 → 1024 → 512 → 128 → 32
+        ppnet_dims = [concat_dim, 1024, 512, 128, 32]
+        self.ppnet_linears = nn.ModuleList()
+        self.ppnet_gates   = nn.ModuleList()
+        self.ppnet_norms   = nn.ModuleList()
+        for i in range(len(ppnet_dims) - 1):
+            self.ppnet_linears.append(nn.Linear(ppnet_dims[i], ppnet_dims[i + 1]))
+            self.ppnet_gates.append(PPNetGate(gate_input_dim=query_gate_dim,
+                                              hidden_dim=ppnet_dims[i + 1]))
+            self.ppnet_norms.append(nn.LayerNorm(ppnet_dims[i + 1]))
 
-        # Learnable weight to combine FM and deep outputs
-        self.fm_weight = nn.Parameter(torch.ones(1))
+        ppnet_out_dim = ppnet_dims[-1]  # 32
+
+        # Final MLP: [concat_dim + ppnet_out_dim, 1024, 512, 128, 32, 1]
+        final_in = concat_dim + ppnet_out_dim  # 384 + 32 = 416
+        self.final_mlp = nn.Sequential(
+            nn.Linear(final_in, 1024), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(1024, 512),     nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(512, 128),      nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 32),       nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
     def forward(
         self,
@@ -457,43 +491,45 @@ class ThreeTowerReranker(nn.Module):
         item_categorical: Dict[str, torch.Tensor],
         user_cf_bpr: torch.Tensor,
         user_categorical: Dict[str, torch.Tensor],
+        query_gate_emb: torch.Tensor,           # [batch, 1024] raw query emb for PPNet
         modal_missing_mask: Optional[torch.Tensor] = None,
         cf_bpr_missing: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            intent_features:    [batch, intent_input_dim]
-            modal_embs:         List of 6 × [batch, 128]
-            item_categorical:   Dict of item categorical features
-            user_cf_bpr:        [batch, 128]
-            user_categorical:   Dict of user categorical features
+            intent_features:  [batch, 2048]  (query_emb + history_emb, each 1024)
+            modal_embs:       List of 6 × [batch, 128]
+            item_categorical: {}
+            user_cf_bpr:      [batch, 128]
+            user_categorical: {}
+            query_gate_emb:   [batch, 1024]  raw query emb (gate signal for PPNet)
             modal_missing_mask: [batch, 6] bool
-            cf_bpr_missing:     [batch] bool
+            cf_bpr_missing:   [batch] bool
         Returns:
             [batch] predicted scores
         """
-        intent_repr = self.intent_tower(intent_features)             # [B, 128]
-        item_repr   = self.item_tower(
-            intent_repr, modal_embs, item_categorical,
-            modal_missing_mask=modal_missing_mask,
-        )                                                             # [B, 128]
-        user_repr   = self.user_tower(
-            user_cf_bpr, user_categorical,
-            cf_bpr_missing=cf_bpr_missing,
-        )                                                             # [B, 128]
+        intent_repr = self.intent_tower(intent_features)
+        item_repr   = self.item_tower(intent_repr, modal_embs, item_categorical,
+                                      modal_missing_mask=modal_missing_mask)
+        user_repr   = self.user_tower(user_cf_bpr, user_categorical,
+                                      cf_bpr_missing=cf_bpr_missing)
 
-        # Concat all tower outputs → [B, 384]
-        combined = torch.cat([intent_repr, item_repr, user_repr], dim=1)
+        combined = torch.cat([intent_repr, item_repr, user_repr], dim=1)  # [B, 384]
 
-        # FM second-order  → [B, 1]
-        fm_out   = self.fm_layer(combined)                           # [B, 1]
+        # Branch A: DCN
+        cross_out = self.dcn_layer(combined)   # [B, 384]
 
-        # DCN cross + deep → [B, 1]
-        cross_out = self.dcn_layer(combined)                         # [B, 384]
-        deep_out  = self.deep_mlp(cross_out)                         # [B, 1]
+        # Branch B: PPNet-DNN
+        ppnet_h = combined
+        for linear, gate_module, norm in zip(
+            self.ppnet_linears, self.ppnet_gates, self.ppnet_norms
+        ):
+            ppnet_h = F.relu(norm(gate_module(query_gate_emb, linear(ppnet_h))))
+        ppnet_out = ppnet_h   # [B, 32]
 
-        # Weighted sum then squeeze to [B]
-        score = (self.fm_weight * fm_out + deep_out).squeeze(-1)
+        # Concat and final MLP
+        out = torch.cat([cross_out, ppnet_out], dim=1)   # [B, 416]
+        score = self.final_mlp(out).squeeze(-1)           # [B]
         return score
 
 
@@ -568,13 +604,13 @@ class ThreeTowerRerankerWrapper:
             self.tokenizer  = AutoTokenizer.from_pretrained(qwen_model_path)
             self.qwen_model = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
 
-        logger.info("Initializing three-tower model …")
+        logger.info("Initializing three-tower model (DCN+PPNet) …")
         self.model = ThreeTowerReranker(
-            intent_input_dim=256,   # query(128) + history_avg(128)
+            intent_input_dim=2048,   # query(1024) + history(1024)
             tower_output_dim=128,
+            query_gate_dim=1024,
             item_vocab_sizes={},
             user_vocab_sizes={},
-            fm_factor_dim=16,
             num_cross_layers=3,
         ).to(device)
 
@@ -760,13 +796,17 @@ class ThreeTowerRerankerWrapper:
         logger.info("QwenEmbeddingCache injected into ThreeTowerRerankerWrapper (%d entries).", len(cache))
 
     def _get_turn_emb(self, session_id: Optional[str], turn_number: Optional[int],
-                      role: str, fallback_text: str, dim: int = 128) -> torch.Tensor:
-        """Look up turn store; fall back to text encoding if not found."""
+                      role: str, fallback_text: str, dim: int = 1024) -> torch.Tensor:
+        """Look up turn store (new key format: {session_id}_{turn}_{role}).
+        Role should be 'query' or 'history'.
+        Falls back to text encoding if not found."""
         store = getattr(self, "_turn_store", None)
         if store is not None and session_id and turn_number is not None:
-            key = f"{session_id}__{turn_number}_{role}"
+            key = f"{session_id}_{turn_number}_{role}"
             if key in store:
                 vec = store[key].float()[:dim]
+                if vec.shape[0] < dim:
+                    vec = F.pad(vec, (0, dim - vec.shape[0]))
                 return F.normalize(vec.unsqueeze(0), p=2, dim=1).squeeze(0)
         return self._encode_text(fallback_text, max_dim=dim)
 
@@ -795,14 +835,16 @@ class ThreeTowerRerankerWrapper:
         self.model.eval()
         with torch.no_grad():
             # ── intent embeddings via turn store or text encode ───────────
-            query_emb        = self._get_turn_emb(session_id, turn_number, "user",
-                                                  current_query, dim=128)
-            history_emb      = self._get_turn_emb(session_id, turn_number, "history_avg",
-                                                  history_context, dim=128)
+            query_emb   = self._get_turn_emb(session_id, turn_number, "query",
+                                               current_query, dim=1024)
+            history_emb = self._get_turn_emb(session_id, turn_number, "history",
+                                               history_context, dim=1024)
             intent_features = (
                 torch.cat([query_emb, history_emb])
                 .unsqueeze(0).repeat(N, 1).to(self.device)
-            )  # [N, 256]
+            )  # [N, 2048]
+            # raw query emb for PPNet gate — replicated for all candidates
+            query_gate_emb = query_emb.unsqueeze(0).repeat(N, 1).to(self.device)  # [N, 1024]
 
             # ── user features + cf_bpr_missing mask ──────────────────────
             if user_id and user_id in self.user_embeddings:
@@ -857,6 +899,7 @@ class ThreeTowerRerankerWrapper:
                 item_categorical,
                 user_cf_bpr,
                 user_categorical,
+                query_gate_emb=query_gate_emb,
                 modal_missing_mask=modal_missing_mask,
                 cf_bpr_missing=cf_bpr_missing,
             )
@@ -895,14 +938,22 @@ class ThreeTowerRerankerWrapper:
 
     def _load_checkpoint(self):
         ckpt_path = os.path.join(self.model_dir, "model.pt")
-        if os.path.exists(ckpt_path):
-            logger.info("Loading checkpoint from %s", ckpt_path)
-            ckpt = torch.load(ckpt_path, map_location=self.device)
+        if not os.path.exists(ckpt_path):
+            logger.info("No checkpoint found; starting from scratch.")
+            return
+        logger.info("Loading checkpoint from %s", ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        try:
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            logger.info("Checkpoint loaded.")
-        else:
-            logger.info("No checkpoint found; starting from scratch.")
+            logger.info("Checkpoint loaded successfully.")
+        except RuntimeError as e:
+            logger.warning(
+                "Checkpoint architecture mismatch — starting from scratch.\n"
+                "  Reason: %s\n"
+                "  Old checkpoint will be overwritten on next save.",
+                e,
+            )
 
     def save_checkpoint(self):
         ckpt_path = os.path.join(self.model_dir, "model.pt")

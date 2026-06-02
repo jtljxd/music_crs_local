@@ -341,8 +341,8 @@ class MultiChannelRetrieval:
         kept so that all tracks remain retrievable).
         """
         cf_bpr_path     = os.path.join(self.index_dir, "track_cf_bpr.pt")
-        metadata_path   = os.path.join(self.index_dir, "track_metadata_128.pt")
-        attributes_path = os.path.join(self.index_dir, "track_attributes_128.pt")
+        metadata_path   = os.path.join(self.index_dir, "track_metadata_1024.pt")
+        attributes_path = os.path.join(self.index_dir, "track_attributes_1024.pt")
         track_ids_path  = os.path.join(self.index_dir, "track_ids.json")
 
         if all(os.path.exists(p) for p in [cf_bpr_path, metadata_path, attributes_path, track_ids_path]):
@@ -366,11 +366,11 @@ class MultiChannelRetrieval:
         for tid in track_ids:
             embs = self.track_embeddings[tid]
             cf_bpr_list.append(embs["cf-bpr"])
-            # Take first 128 dims (zero-pad if shorter)
+            # Take first 1024 dims (zero-pad if shorter)
             meta  = embs["metadata-qwen3_embedding_0.6b"]
             attr  = embs["attributes-qwen3_embedding_0.6b"]
-            metadata_list.append(self._raw_to_tensor(meta.tolist(), 128))
-            attributes_list.append(self._raw_to_tensor(attr.tolist(), 128))
+            metadata_list.append(self._raw_to_tensor(meta.tolist(), 1024))
+            attributes_list.append(self._raw_to_tensor(attr.tolist(), 1024))
 
         self.track_cf_bpr_matrix     = F.normalize(torch.stack(cf_bpr_list),     p=2, dim=1)
         self.track_metadata_matrix   = F.normalize(torch.stack(metadata_list),   p=2, dim=1)
@@ -620,16 +620,17 @@ class MultiChannelRetrieval:
             history_queries = []
 
         store = getattr(self, "_turn_store", None)
-        # Use turn store (128-dim) if available; otherwise encode via Qwen (256-dim fallback)
+        # Use turn store (1024-dim) if available; otherwise encode via Qwen (fallback)
+        # New key format: {session_id}_{turn}_query / {session_id}_{turn}_history
         if store is not None and session_id is not None and turn_number is not None:
-            user_key = f"{session_id}__{turn_number}_user"
-            hist_key = f"{session_id}__{turn_number}_history_avg"
+            user_key = f"{session_id}_{turn_number}_query"
+            hist_key = f"{session_id}_{turn_number}_history"
             current_emb = (
-                store[user_key].float()[:128] if user_key in store
-                else self._encode_query(current_query)[:128]
+                store[user_key].float()[:1024] if user_key in store
+                else self._encode_query(current_query)[:1024]
             )
             hist_emb_raw = (
-                store[hist_key].float()[:128] if hist_key in store else None
+                store[hist_key].float()[:1024] if hist_key in store else None
             )
             current_emb = F.normalize(current_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
             if hist_emb_raw is not None:
@@ -638,10 +639,10 @@ class MultiChannelRetrieval:
             else:
                 query_emb = current_emb
         else:
-            # Fallback: encode via Qwen, take first 128 dims
-            current_emb = self._encode_query(current_query)[:128]
+            # Fallback: encode via Qwen, take first 1024 dims
+            current_emb = self._encode_query(current_query)[:1024]
             if history_queries:
-                hist_embs = [self._encode_query(q)[:128] for q in history_queries]
+                hist_embs = [self._encode_query(q)[:1024] for q in history_queries]
                 hist_emb  = torch.stack(hist_embs).mean(dim=0)
                 query_emb = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
             else:
