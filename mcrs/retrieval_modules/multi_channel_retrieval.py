@@ -67,6 +67,7 @@ class MultiChannelRetrieval:
         batch_size: int = 32,
         qwen_model=None,       # pre-loaded shared instance (optional)
         qwen_tokenizer=None,   # pre-loaded shared instance (optional)
+        build_indices: bool = True,  # False during inference (load-only)
     ):
         self.dataset_name    = dataset_name
         self.item_db_name    = item_db_name
@@ -103,24 +104,22 @@ class MultiChannelRetrieval:
             self._qwen_device = "cpu"
 
         logger.info("Building track embedding indices …")
-        self._build_track_indices()
+        self._build_track_indices(build=build_indices)
 
         # ── BM25 index (Channel 5) ────────────────────────────────────────
-        logger.info("Building BM25 index …")
-        self._build_bm25_index()
+        logger.info("%s BM25 index …", "Building" if build_indices else "Loading")
+        self._build_bm25_index(build=build_indices)
 
-        # ── BERT index (Channel 6) ────────────────────────────────────────
-        # Use local Qwen3-Embedding-0.6B as the "BERT" encoder to avoid
-        # any network dependency.  Same interface, no download needed.
-        logger.info("Building semantic embedding index (Qwen3-0.6B) …")
-        _bert_model_name = qwen_model_path   # reuse local Qwen model
+        # ── Semantic index (Channel 6, Qwen3-0.6B) ───────────────────────
+        logger.info("%s semantic embedding index …", "Building" if build_indices else "Loading")
+        _bert_model_name = qwen_model_path
         self._bert_tokenizer = AutoTokenizer.from_pretrained(
             _bert_model_name, use_fast=True
         )
         self._bert_model = AutoModel.from_pretrained(_bert_model_name).eval()
         self._bert_device = device
         self._bert_model.to(self._bert_device)
-        self._build_bert_index()
+        self._build_bert_index(build=build_indices)
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -336,16 +335,13 @@ class MultiChannelRetrieval:
 
     # ── index build ──────────────────────────────────────────────────────────
 
-    def _build_track_indices(self):
-        """Build CF-BPR / metadata / attributes matrices for retrieval.
-
-        Every track in self.track_embeddings is included (zero-filled rows are
-        kept so that all tracks remain retrievable).
-        """
-        cf_bpr_path     = os.path.join(self.index_dir, "track_cf_bpr.pt")
-        metadata_path   = os.path.join(self.index_dir, "track_metadata_1024.pt")
-        attributes_path = os.path.join(self.index_dir, "track_attributes_1024.pt")
-        track_ids_path  = os.path.join(self.index_dir, "track_ids.json")
+    def _build_track_indices(self, build: bool = True):
+        """Build or load CF-BPR / metadata / attributes matrices."""
+        _idx_dir        = os.path.join("qwen", "retrieval_indices", "track_indices")
+        cf_bpr_path     = os.path.join(_idx_dir, "track_cf_bpr.pt")
+        metadata_path   = os.path.join(_idx_dir, "track_metadata_1024.pt")
+        attributes_path = os.path.join(_idx_dir, "track_attributes_1024.pt")
+        track_ids_path  = os.path.join(_idx_dir, "track_ids.json")
 
         if all(os.path.exists(p) for p in [cf_bpr_path, metadata_path, attributes_path, track_ids_path]):
             logger.info("Loading pre-computed track indices …")
@@ -357,7 +353,15 @@ class MultiChannelRetrieval:
             logger.info("Loaded index for %d tracks.", len(self.track_ids_list))
             return
 
+        if not build:
+            raise FileNotFoundError(
+                "Track indices not found and build=False (inference mode).\n"
+                f"  Expected: {cf_bpr_path}\n"
+                "  Run training first to build indices."
+            )
+
         logger.info("Building track indices …")
+        os.makedirs(_idx_dir, exist_ok=True)
         track_ids = sorted(self.track_embeddings.keys())
         self.track_ids_list = track_ids
 
@@ -514,8 +518,8 @@ class MultiChannelRetrieval:
                 parts.append(str(val))
         return " ".join(parts)
 
-    def _build_bm25_index(self):
-        bm25_dir  = os.path.join(self.index_dir, "bm25_index")
+    def _build_bm25_index(self, build: bool = True):
+        bm25_dir  = os.path.join("qwen", "retrieval_indices", "bm25_index")
         ids_path  = os.path.join(bm25_dir, "track_ids.json")
         if os.path.exists(ids_path):
             logger.info("Loading cached BM25 index …")
@@ -524,6 +528,12 @@ class MultiChannelRetrieval:
                 self._bm25_track_ids = json.load(f)
             logger.info("  BM25 index loaded (%d tracks).", len(self._bm25_track_ids))
             return
+        if not build:
+            raise FileNotFoundError(
+                "BM25 index not found and build=False (inference mode).\n"
+                f"  Expected: {ids_path}\n"
+                "  Run training first to build the index."
+            )
         os.makedirs(bm25_dir, exist_ok=True)
         track_ids = list(self.track_metadata_dict.keys())
         corpus    = [self._stringify_metadata(tid) for tid in track_ids]
@@ -546,26 +556,34 @@ class MultiChannelRetrieval:
 
     # ── BERT helpers (Channel 6) ─────────────────────────────────────────────
 
-    def _build_bert_index(self):
-        bert_dir    = os.path.join(self.index_dir, "qwen_semantic_index")
+    def _build_bert_index(self, build: bool = True):
+        bert_dir    = os.path.join("qwen", "retrieval_indices", "qwen_semantic_index")
         emb_path    = os.path.join(bert_dir, "embeddings.pt")
         ids_path    = os.path.join(bert_dir, "track_ids.json")
         if os.path.exists(emb_path) and os.path.exists(ids_path):
-            logger.info("Loading cached BERT index …")
+            logger.info("Loading cached semantic index …")
             self._bert_matrix    = torch.load(emb_path, map_location="cpu",
                                                weights_only=True)
             with open(ids_path) as f:
                 self._bert_track_ids = json.load(f)
-            logger.info("  BERT index loaded (%d tracks).", len(self._bert_track_ids))
+            logger.info("  Semantic index loaded (%d tracks).", len(self._bert_track_ids))
             return
+        if not build:
+            raise FileNotFoundError(
+                "Semantic index not found and build=False (inference mode).\n"
+                f"  Expected: {emb_path}\n"
+                "  Run training first to build the index."
+            )
         os.makedirs(bert_dir, exist_ok=True)
         track_ids = list(self.track_metadata_dict.keys())
         texts     = [self._stringify_metadata(tid) for tid in track_ids]
         all_embs  = []
-        bs = 64
+        bs = 256  # Qwen3-0.6B; increase if OOM
         self._bert_model.eval()
         with torch.no_grad():
-            for start in range(0, len(texts), bs):
+            from tqdm import tqdm as _tqdm
+            for start in _tqdm(range(0, len(texts), bs),
+                               desc="Building semantic index", unit="batch"):
                 batch  = texts[start: start + bs]
                 inputs = self._bert_tokenizer(batch, padding=True, truncation=True,
                                               max_length=128, return_tensors="pt")

@@ -92,6 +92,7 @@ def load_crs_baseline_v2(
     retrieval_topk: int = 350,
     rerank_topk: int = 20,
     reranker_lr: float = 1e-3,
+    build_indices: bool = False,  # True only during training
 ) -> CRS_BASELINE_V2:
     """Factory function to create a CRS_BASELINE_V2 instance (add_all_feature_v2).
 
@@ -142,4 +143,5 @@ def load_crs_baseline_v2(
         retrieval_topk=retrieval_topk,
         rerank_topk=rerank_topk,
         reranker_lr=reranker_lr,
+        build_indices=build_indices,
     )

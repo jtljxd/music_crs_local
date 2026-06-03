@@ -2,28 +2,29 @@
 Three-Tower Reranker Training Script (v3) — DCN + PPNet
 ========================================================
 
-New features vs v2:
-  - emb key format: {session_id}_{turn}_query / {session_id}_{turn}_history (1024-dim, 0.6B)
-  - Model: DCN (3 cross layers) + PPNet-DNN gated by 1024-dim query emb
-  - Label: any track in conversations = positive (label=1.0)
-  - Negatives per positive:
-      5  in-batch hard (different session_id)
-      5  super-hard from recall (BM25, excl. session positives)
-      10 easy (random from full track pool)
-  - Training schedule:
-      Phase 1 — train split,  5 epochs
-      Phase 2 — test  split,  2 epochs  (fine-tune, lower lr)
+- emb key format: {session_id}_{turn}_query / {session_id}_{turn}_history (1024-dim, 0.6B)
+- Model: DCN (3 cross layers) + PPNet-DNN gated by 1024-dim query emb
+- Label: any track in conversations = positive (label=1.0)
+- Negatives per positive:
+    5  in-batch hard (different session_id)
+    5  super-hard from FULL recall (all 6 channels, 600 candidates, randomly pick 5)
+    10 easy (random from full track pool)
+- Training: builds all retrieval indices (BM25, semantic, track matrices) on first run,
+  persisted to qwen/retrieval_indices/ so inference never needs to rebuild.
+- Training schedule:
+    Phase 1 — train split,  5 epochs
+    Phase 2 — test  split,  2 epochs  (fine-tune, lower lr)
 
 Usage (background):
-    nohup python train_three_tower.py \
-        --config config/llama1b_multi_channel_devset.yaml \
-        --train_store qwen/dialogue_embeddings_train_0.6b.pt \
-        --test_store  qwen/dialogue_embeddings_test_0.6b.pt \
-        --train_epochs 5 \
-        --test_epochs  2 \
-        --batch_size 32 \
-        --lr 1e-3 \
-        --lr_finetune 3e-4 \
+    nohup python train_three_tower.py \\
+        --config config/llama1b_multi_channel_devset.yaml \\
+        --train_store qwen/dialogue_embeddings_train_0.6b.pt \\
+        --test_store  qwen/dialogue_embeddings_test_0.6b.pt \\
+        --train_epochs 5 \\
+        --test_epochs  2 \\
+        --batch_size 32 \\
+        --lr 1e-3 \\
+        --lr_finetune 3e-4 \\
     > train_three_tower.log 2>&1 &
 """
 
@@ -33,7 +34,6 @@ import os
 import random
 from typing import Dict, List, Optional, Tuple, Set
 
-import bm25s
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -44,6 +44,7 @@ from mcrs.reranking_modules.three_tower_reranker import (
     ThreeTowerReranker,
     ThreeTowerRerankerWrapper,
 )
+from mcrs.retrieval_modules.multi_channel_retrieval import MultiChannelRetrieval
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,63 +53,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# emb dimension (0.6B model output)
 EMB_DIM = 1024
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  BM25 helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_or_build_bm25(
-    cache_dir: str,
-    track_metadata_dict: Dict,
-) -> Tuple[object, List[str]]:
-    """Load BM25 index from cache, or build it from track_metadata_dict."""
-    import json
-    bm25_dir = os.path.join(cache_dir, "multi_channel_retrieval", "bm25_index")
-    ids_path = os.path.join(bm25_dir, "track_ids.json")
-
-    if os.path.exists(ids_path):
-        logger.info("Loading cached BM25 index from %s …", bm25_dir)
-        model = bm25s.BM25.load(bm25_dir, load_corpus=True)
-        with open(ids_path) as f:
-            track_ids = json.load(f)
-        logger.info("  BM25 index loaded (%d tracks).", len(track_ids))
-        return model, track_ids
-
-    logger.info("BM25 index not found. Building from track metadata …")
-    os.makedirs(bm25_dir, exist_ok=True)
-
-    track_ids = list(track_metadata_dict.keys())
-    corpus = []
-    for tid in track_ids:
-        meta  = track_metadata_dict[tid]
-        parts = []
-        for field in ["track_name", "artist_name", "album_name", "tag_list", "release_date"]:
-            val = meta.get(field, "")
-            if isinstance(val, list):
-                val = " ".join(str(v) for v in val)
-            if val:
-                parts.append(str(val))
-        corpus.append(" ".join(parts))
-
-    tokens  = bm25s.tokenize(corpus)
-    bm25_m  = bm25s.BM25()
-    bm25_m.index(tokens)
-    bm25_m.save(bm25_dir, corpus=corpus)
-    with open(ids_path, "w") as f:
-        json.dump(track_ids, f)
-
-    logger.info("BM25 index built and saved (%d tracks).", len(track_ids))
-    bm25_m = bm25s.BM25.load(bm25_dir, load_corpus=True)
-    return bm25_m, track_ids
-
-
-def bm25_recall(model, track_ids: List[str], query: str, topk: int = 50) -> List[str]:
-    tokens  = bm25s.tokenize([query.lower()])
-    results = model.retrieve(tokens, k=min(topk, len(track_ids)), return_as="tuple")
-    return [track_ids[item["id"]] for item in results.documents[0]]
+RECALL_TOPK = 600   # full recall pool; randomly pick 5 super-hard negatives from it
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +62,6 @@ def bm25_recall(model, track_ids: List[str], query: str, topk: int = 50) -> List
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_emb(store: Dict, key: str, dim: int = EMB_DIM) -> torch.Tensor:
-    """Fetch tensor from store, truncate/pad to dim, float32."""
     if key in store:
         v = store[key].float()
         if v.shape[0] > dim:
@@ -132,28 +77,21 @@ def build_training_samples(
     split: str,
     turn_store: Dict[str, torch.Tensor],
 ) -> List[Dict]:
-    """
-    Returns a list of sample dicts, one per (session, music-turn).
-    All tracks appearing in conversations are positives (label=1.0).
-    New key format: {session_id}_{turn}_query / {session_id}_{turn}_history
-    """
-    logger.info("Loading conversation dataset '%s' split='%s' …", dataset_name, split)
+    """One sample per (session, music-turn). All tracks = positives."""
+    logger.info("Loading '%s' split='%s' …", dataset_name, split)
     ds = load_dataset(dataset_name, split=split)
 
-    samples = []
-    skipped = 0
+    samples, skipped = [], 0
 
     for item in tqdm(ds, desc=f"Building samples [{split}]", unit="session"):
         session_id = item["session_id"]
         user_id    = item.get("user_id", None)
         convs      = item["conversations"]
 
-        # Collect ALL music tracks in this session → all are positives
         music_turns: Dict[int, str] = {}
         for c in convs:
             if c.get("role") == "music" and c.get("content"):
                 music_turns[int(c["turn_number"])] = c["content"]
-
         if not music_turns:
             continue
 
@@ -161,15 +99,13 @@ def build_training_samples(
 
         for turn_number, track_id in music_turns.items():
             q_key = f"{session_id}_{turn_number}_query"
-            h_key = f"{session_id}_{turn_number}_history"
             if q_key not in turn_store:
                 skipped += 1
                 continue
 
             query_emb   = _get_emb(turn_store, q_key)
-            history_emb = _get_emb(turn_store, h_key)
+            history_emb = _get_emb(turn_store, f"{session_id}_{turn_number}_history")
 
-            # user query text for BM25 recall
             user_query = ""
             for c in convs:
                 if int(c["turn_number"]) == turn_number and c["role"] == "user":
@@ -183,8 +119,8 @@ def build_training_samples(
                 "track_id":             track_id,
                 "session_positive_ids": session_positive_ids,
                 "user_query":           user_query,
-                "query_emb":            query_emb,   # [1024]
-                "history_emb":          history_emb, # [1024]
+                "query_emb":            query_emb,
+                "history_emb":          history_emb,
             })
 
     logger.info("Built %d samples from '%s' (skipped %d).", len(samples), split, skipped)
@@ -200,17 +136,13 @@ TRACK_DIM        = ThreeTowerRerankerWrapper.TRACK_MODAL_TARGET_DIM
 USER_DIM         = ThreeTowerRerankerWrapper.USER_CF_BPR_TARGET_DIM
 
 
-def build_track_features(
-    track_id: str,
-    track_embeddings: Dict,
-) -> Tuple[List[torch.Tensor], List[bool]]:
+def build_track_features(track_id, track_embeddings):
     if track_id in track_embeddings:
         embs    = track_embeddings[track_id]
         missing = set(embs["__missing__"])
     else:
         embs    = {}
         missing = set(TRACK_MODAL_COLS)
-
     modal_embs, missing_flags = [], []
     for col in TRACK_MODAL_COLS:
         if col in missing or col not in embs:
@@ -222,11 +154,35 @@ def build_track_features(
     return modal_embs, missing_flags
 
 
-def build_user_features(user_id, user_embeddings) -> Tuple[torch.Tensor, bool]:
+def build_user_features(user_id, user_embeddings):
     if user_id and user_id in user_embeddings:
         data = user_embeddings[user_id]
         return data["cf-bpr"], ("cf-bpr" in data["__missing__"])
     return torch.zeros(USER_DIM), True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Full-channel recall helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def full_recall(
+    retrieval: MultiChannelRetrieval,
+    sample: Dict,
+    topk: int = RECALL_TOPK,
+) -> List[str]:
+    """Run all 6 retrieval channels, return up to topk deduplicated candidates."""
+    try:
+        candidates = retrieval.retrieve(
+            user_id       = sample["user_id"],
+            current_query = sample["user_query"],
+            history_queries = [],
+            session_id    = sample["session_id"],
+            turn_number   = sample["turn_number"],
+        )
+        return candidates[:topk]
+    except Exception as e:
+        logger.debug("Recall failed for session %s: %s", sample["session_id"], e)
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,37 +195,23 @@ def collate_batch(
     track_embeddings: Dict,
     user_embeddings: Dict,
     device: str,
-    bm25_model=None,
-    bm25_track_ids: Optional[List[str]] = None,
+    retrieval: MultiChannelRetrieval,
     num_hard_neg: int = 5,
     num_recall_neg: int = 5,
     num_easy_neg: int = 10,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """
-    Per sample:
-      1  positive  (label=1.0)
-      num_hard_neg  in-batch hard negatives  (different session_id)
-      num_recall_neg super-hard recall negatives (BM25, excl. session positives)
-      num_easy_neg   easy negatives (random)
-    """
-    rows_intent     = []
-    rows_gate       = []   # PPNet gate: raw query_emb [1024]
-    rows_modal      = [[] for _ in TRACK_MODAL_COLS]
-    rows_modal_mask = []
-    rows_user_bpr   = []
-    rows_cf_missing = []
-    labels          = []
+    rows_intent, rows_gate = [], []
+    rows_modal  = [[] for _ in TRACK_MODAL_COLS]
+    rows_modal_mask, rows_user_bpr, rows_cf_missing, labels = [], [], [], []
 
     batch_session_ids = [s["session_id"] for s in samples]
     batch_track_ids   = [s["track_id"]   for s in samples]
 
-    def _add_row(s: Dict, track_id: str, lbl: float):
-        # intent = concat(query_emb, history_emb) [2048]
+    def _add_row(s, track_id, lbl):
         intent = torch.cat([s["query_emb"], s["history_emb"]])
-        gate   = s["query_emb"]   # [1024] for PPNet gate
+        gate   = s["query_emb"]
         u_bpr, u_miss = build_user_features(s["user_id"], user_embeddings)
         me, mf = build_track_features(track_id, track_embeddings)
-
         rows_intent.append(intent)
         rows_gate.append(gate)
         for j, emb in enumerate(me):
@@ -288,25 +230,27 @@ def collate_batch(
         for j in (random.sample(diff_idx, min(num_hard_neg, len(diff_idx))) if diff_idx else []):
             _add_row(s, batch_track_ids[j], 0.0)
 
-        # super-hard recall negatives (BM25)
-        recall = []
-        if bm25_model is not None and s["user_query"]:
-            recall_raw = bm25_recall(bm25_model, bm25_track_ids, s["user_query"], topk=50)
-            recall = [t for t in recall_raw if t not in s["session_positive_ids"]]
-        for tid in (random.sample(recall, min(num_recall_neg, len(recall))) if recall else []):
+        # super-hard recall negatives (all 6 channels, 600 candidates → random 5)
+        if s["user_query"]:
+            recall_pool = full_recall(retrieval, s, topk=RECALL_TOPK)
+            recall_pool = [t for t in recall_pool if t not in s["session_positive_ids"]]
+        else:
+            recall_pool = []
+        for tid in (random.sample(recall_pool, min(num_recall_neg, len(recall_pool)))
+                    if recall_pool else []):
             _add_row(s, tid, 0.0)
 
         # easy negatives (random)
         for _ in range(num_easy_neg):
             _add_row(s, random.choice(all_track_ids), 0.0)
 
-    intent_tensor  = torch.stack(rows_intent).to(device)     # [B, 2048]
-    gate_tensor    = torch.stack(rows_gate).to(device)        # [B, 1024]
-    modal_tensors  = [torch.stack(rows_modal[j]).to(device) for j in range(len(TRACK_MODAL_COLS))]
-    modal_mask     = torch.tensor(rows_modal_mask, dtype=torch.bool, device=device)
-    user_bpr       = torch.stack(rows_user_bpr).to(device)
-    cf_missing     = torch.tensor(rows_cf_missing, dtype=torch.bool, device=device)
-    label_tensor   = torch.tensor(labels, dtype=torch.float32, device=device)
+    intent_tensor = torch.stack(rows_intent).to(device)
+    gate_tensor   = torch.stack(rows_gate).to(device)
+    modal_tensors = [torch.stack(rows_modal[j]).to(device) for j in range(len(TRACK_MODAL_COLS))]
+    modal_mask    = torch.tensor(rows_modal_mask, dtype=torch.bool, device=device)
+    user_bpr      = torch.stack(rows_user_bpr).to(device)
+    cf_missing    = torch.tensor(rows_cf_missing, dtype=torch.bool, device=device)
+    label_tensor  = torch.tensor(labels, dtype=torch.float32, device=device)
 
     model_inputs = dict(
         intent_features    = intent_tensor,
@@ -326,23 +270,13 @@ def collate_batch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_phase(
-    phase_name: str,
-    samples: List[Dict],
-    model: ThreeTowerReranker,
-    optimizer: torch.optim.Optimizer,
-    track_embs: Dict,
-    user_embs: Dict,
-    all_tids: List[str],
-    bm25_model,
-    bm25_tids: List[str],
-    wrapper: "ThreeTowerRerankerWrapper",
-    args,
-    epochs: int,
-    device: str,
-    checkpoint_dir: str,
+    phase_name, samples, model, optimizer,
+    track_embs, user_embs, all_tids,
+    retrieval, wrapper, args, epochs, device, checkpoint_dir,
 ):
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    logger.info("[%s] %d samples, %d epochs, batch=%d", phase_name, len(samples), epochs, args.batch_size)
+    logger.info("[%s] %d samples, %d epochs, batch=%d",
+                phase_name, len(samples), epochs, args.batch_size)
 
     global_step = 0
     for epoch in range(1, epochs + 1):
@@ -350,11 +284,8 @@ def run_phase(
         model.train()
         epoch_loss, epoch_steps = 0.0, 0
 
-        pbar = tqdm(
-            range(0, len(samples), args.batch_size),
-            desc=f"[{phase_name}] Epoch {epoch}/{epochs}",
-            unit="batch",
-        )
+        pbar = tqdm(range(0, len(samples), args.batch_size),
+                    desc=f"[{phase_name}] Epoch {epoch}/{epochs}", unit="batch")
         for batch_start in pbar:
             batch = samples[batch_start: batch_start + args.batch_size]
             if not batch:
@@ -362,7 +293,7 @@ def run_phase(
 
             model_inputs, label_tensor = collate_batch(
                 batch, all_tids, track_embs, user_embs, device,
-                bm25_model=bm25_model, bm25_track_ids=bm25_tids,
+                retrieval=retrieval,
                 num_hard_neg=5, num_recall_neg=5, num_easy_neg=10,
             )
 
@@ -381,16 +312,13 @@ def run_phase(
 
             if global_step % args.save_every == 0:
                 wrapper.save_checkpoint()
-                logger.info("[%s] Step %d: checkpoint saved.", phase_name, global_step)
 
         avg_loss = epoch_loss / max(epoch_steps, 1)
         logger.info("[%s] Epoch %d done. avg_loss=%.4f", phase_name, epoch, avg_loss)
-
-        # Save per-epoch checkpoint
         wrapper.save_checkpoint()
         ep_path = os.path.join(checkpoint_dir, f"model_{phase_name}_epoch{epoch}.pt")
         torch.save({"model_state_dict": model.state_dict()}, ep_path)
-        logger.info("[%s] Epoch %d checkpoint → %s", phase_name, epoch, ep_path)
+        logger.info("[%s] Checkpoint → %s", phase_name, ep_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,26 +339,47 @@ def train(args):
 
     # ── Load turn stores ─────────────────────────────────────────────────────
     logger.info("Loading train turn store from %s …", args.train_store)
-    train_store: Dict[str, torch.Tensor] = torch.load(
-        args.train_store, map_location="cpu", weights_only=True
-    )
+    train_store = torch.load(args.train_store, map_location="cpu", weights_only=True)
     logger.info("  train: %d entries.", len(train_store))
 
     logger.info("Loading test turn store from %s …", args.test_store)
-    test_store: Dict[str, torch.Tensor] = torch.load(
-        args.test_store, map_location="cpu", weights_only=True
-    )
+    test_store = torch.load(args.test_store, map_location="cpu", weights_only=True)
     logger.info("  test:  %d entries.", len(test_store))
 
-    # ── Build samples for both splits ────────────────────────────────────────
+    # ── Build samples ────────────────────────────────────────────────────────
     train_samples = build_training_samples(dataset_name, "train", train_store)
     test_samples  = build_training_samples(dataset_name, "test",  test_store)
-
     if not train_samples:
         logger.error("No training samples built.")
         return
 
-    # ── Initialize wrapper ───────────────────────────────────────────────────
+    # ── Initialize MultiChannelRetrieval (build_indices=True) ────────────────
+    logger.info("Initializing MultiChannelRetrieval (build_indices=True) …")
+    from transformers import AutoTokenizer, AutoModel
+    qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
+    qwen_model     = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
+
+    retrieval = MultiChannelRetrieval(
+        dataset_name      = dataset_name,
+        item_db_name      = config.get("item_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-Track-Metadata"),
+        user_db_name      = config.get("user_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-User-Metadata"),
+        track_emb_db_name = config.get("track_emb_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"),
+        user_emb_db_name  = config.get("user_emb_db_name",
+            "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"),
+        split_types       = list(config.get("track_split_types", ["all_tracks"])),
+        cache_dir         = cache_dir,
+        qwen_model_path   = qwen_model_path,
+        device            = device,
+        qwen_model        = qwen_model,
+        qwen_tokenizer    = qwen_tokenizer,
+        build_indices     = True,   # ← build all indices on first run
+    )
+    logger.info("All retrieval indices ready.")
+
+    # ── Initialize ThreeTowerRerankerWrapper ──────────────────────────────────
     logger.info("Initializing ThreeTowerRerankerWrapper …")
     wrapper = ThreeTowerRerankerWrapper(
         dataset_name           = dataset_name,
@@ -447,21 +396,24 @@ def train(args):
         qwen_model_path = qwen_model_path,
         device        = device,
         lr            = args.lr,
+        qwen_model    = qwen_model,
+        qwen_tokenizer = qwen_tokenizer,
     )
+
+    # Inject turn store so retrieval can use pre-computed embs
+    retrieval.set_turn_store(train_store)
 
     model      = wrapper.model
     track_embs = wrapper.track_embeddings
     user_embs  = wrapper.user_embeddings
     all_tids   = list(track_embs.keys())
 
-    # ── BM25 for super-hard negatives ────────────────────────────────────────
-    bm25_model, bm25_tids = load_or_build_bm25(cache_dir, wrapper.track_metadata)
-
     checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # ── Phase 1: train split, 5 epochs ───────────────────────────────────────
-    optimizer = wrapper.optimizer   # Adam, lr=args.lr
+    retrieval.set_turn_store(train_store)
+    optimizer = wrapper.optimizer
     run_phase(
         phase_name     = "train",
         samples        = train_samples,
@@ -470,8 +422,7 @@ def train(args):
         track_embs     = track_embs,
         user_embs      = user_embs,
         all_tids       = all_tids,
-        bm25_model     = bm25_model,
-        bm25_tids      = bm25_tids,
+        retrieval      = retrieval,
         wrapper        = wrapper,
         args           = args,
         epochs         = args.train_epochs,
@@ -484,6 +435,7 @@ def train(args):
         logger.info("Phase 2: fine-tuning on test split (lr=%.2e) …", args.lr_finetune)
         for pg in optimizer.param_groups:
             pg["lr"] = args.lr_finetune
+        retrieval.set_turn_store(test_store)
         run_phase(
             phase_name     = "test_ft",
             samples        = test_samples,
@@ -492,8 +444,7 @@ def train(args):
             track_embs     = track_embs,
             user_embs      = user_embs,
             all_tids       = all_tids,
-            bm25_model     = bm25_model,
-            bm25_tids      = bm25_tids,
+            retrieval      = retrieval,
             wrapper        = wrapper,
             args           = args,
             epochs         = args.test_epochs,
@@ -511,16 +462,13 @@ def train(args):
 def parse_args():
     p = argparse.ArgumentParser(description="Train Three-Tower Reranker v3 (DCN+PPNet)")
     p.add_argument("--config",         type=str,   default="config/llama1b_multi_channel_devset.yaml")
-    p.add_argument("--train_store",    type=str,   default="qwen/dialogue_embeddings_train_0.6b.pt",
-                   help="turn store for train split")
-    p.add_argument("--test_store",     type=str,   default="qwen/dialogue_embeddings_test_0.6b.pt",
-                   help="turn store for test split")
+    p.add_argument("--train_store",    type=str,   default="qwen/dialogue_embeddings_train_0.6b.pt")
+    p.add_argument("--test_store",     type=str,   default="qwen/dialogue_embeddings_test_0.6b.pt")
     p.add_argument("--train_epochs",   type=int,   default=5)
     p.add_argument("--test_epochs",    type=int,   default=2)
     p.add_argument("--batch_size",     type=int,   default=32)
     p.add_argument("--lr",             type=float, default=1e-3)
-    p.add_argument("--lr_finetune",    type=float, default=3e-4,
-                   help="learning rate for test-split fine-tuning phase")
+    p.add_argument("--lr_finetune",    type=float, default=3e-4)
     p.add_argument("--checkpoint_dir", type=str,   default="qwen/three_tower_ckpt")
     p.add_argument("--save_every",     type=int,   default=500)
     p.add_argument("--device",         type=str,   default=None)

@@ -45,6 +45,7 @@ class CRS_BASELINE_V2:
         retrieval_topk: int = 350,
         rerank_topk: int = 20,
         reranker_lr: float = 1e-3,
+        build_indices: bool = False,  # True only during training
     ) -> None:
         """Initialize CRS baseline V2.
         
@@ -119,6 +120,7 @@ class CRS_BASELINE_V2:
             device=self.device,
             qwen_model=qwen_model,
             qwen_tokenizer=qwen_tokenizer,
+            build_indices=build_indices,
         )
 
         # Load item and user databases
