@@ -140,6 +140,12 @@ def main(args):
     print(f"  {len(turn_store)} entries loaded.")
     music_crs.set_turn_store(turn_store)
 
+    # ── Load specific checkpoint if requested ────────────────────────────────
+    if getattr(args, "checkpoint", None):
+        print(f"Loading checkpoint from {args.checkpoint} ...")
+        music_crs.reranker.load_checkpoint_from(args.checkpoint)
+        print("Checkpoint loaded.")
+
     # ── Run inference ────────────────────────────────────────────────────────
     inference_results = []
     for i in tqdm(range(0, len(batch_data), args.batch_size), desc="Batch inference"):
@@ -185,5 +191,9 @@ if __name__ == "__main__":
         help="Sub-directory name under exp/inference/ for output",
     )
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="Optional: load weights from a specific .pt file instead of default model.pt",
+    )
     args = parser.parse_args()
     main(args)

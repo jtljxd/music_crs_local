@@ -941,11 +941,18 @@ class ThreeTowerRerankerWrapper:
         if not os.path.exists(ckpt_path):
             logger.info("No checkpoint found; starting from scratch.")
             return
+        self.load_checkpoint_from(ckpt_path)
+
+    def load_checkpoint_from(self, ckpt_path: str):
+        """Load model weights from an arbitrary checkpoint file."""
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         logger.info("Loading checkpoint from %s", ckpt_path)
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         try:
             self.model.load_state_dict(ckpt["model_state_dict"])
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             logger.info("Checkpoint loaded successfully.")
         except RuntimeError as e:
             logger.warning(
