@@ -39,7 +39,9 @@ def chat_history_parser(conversations, music_crs, target_turn_number):
 
 
 def main(args):
-    config          = OmegaConf.load(f"config/{args.tid}.yaml")
+    # --config 直接指定路径，否则用 --tid 拼路径
+    config_path = args.config if args.config else f"config/{args.tid}.yaml"
+    config          = OmegaConf.load(config_path)
     pipeline_version = config.get("pipeline_version", "v2")
     qwen_model_path  = config.get(
         "qwen_model_path",
@@ -118,7 +120,12 @@ def main(args):
         })
 
     # ── Load turn embedding store ────────────────────────────────────────────
-    turn_store_path = "qwen/turn_embeddings_blindA.pt"
+    # --turn_store 直接指定路径，否则用 config 里默认或旧路径
+    turn_store_path = (
+        args.turn_store
+        if args.turn_store
+        else config.get("turn_store_path", "qwen/turn_embeddings_blindA.pt")
+    )
     if not os.path.exists(turn_store_path):
         print(f"Turn embedding store not found at {turn_store_path}.")
         print("Run:  python precompute_turn_embeddings.py "
@@ -164,6 +171,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tid", type=str, default="llama1b_multi_channel_blindset_A",
         help="Config file ID (e.g. llama1b_multi_channel_blindset_A)",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Direct path to config yaml (overrides --tid based path)",
+    )
+    parser.add_argument(
+        "--turn_store", type=str, default=None,
+        help="Path to blind-A turn store .pt file",
     )
     parser.add_argument(
         "--eval_dataset", type=str, default="blindset_A",
