@@ -110,8 +110,10 @@ class MultiChannelRetrieval:
         self._build_bm25_index()
 
         # ── BERT index (Channel 6) ────────────────────────────────────────
-        logger.info("Building BERT embedding index …")
-        _bert_model_name = "bert-base-uncased"
+        # Use local Qwen3-Embedding-0.6B as the "BERT" encoder to avoid
+        # any network dependency.  Same interface, no download needed.
+        logger.info("Building semantic embedding index (Qwen3-0.6B) …")
+        _bert_model_name = qwen_model_path   # reuse local Qwen model
         self._bert_tokenizer = AutoTokenizer.from_pretrained(
             _bert_model_name, use_fast=True
         )
@@ -545,7 +547,7 @@ class MultiChannelRetrieval:
     # ── BERT helpers (Channel 6) ─────────────────────────────────────────────
 
     def _build_bert_index(self):
-        bert_dir    = os.path.join(self.index_dir, "bert_index")
+        bert_dir    = os.path.join(self.index_dir, "qwen_semantic_index")
         emb_path    = os.path.join(bert_dir, "embeddings.pt")
         ids_path    = os.path.join(bert_dir, "track_ids.json")
         if os.path.exists(emb_path) and os.path.exists(ids_path):
