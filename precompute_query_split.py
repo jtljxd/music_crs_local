@@ -133,14 +133,8 @@ def build_history_text(convs: List[dict], before_turn: int) -> str:
     return "\n".join(lines)
 
 
-def build_user_message(history_text: str, current_query: str) -> str:
-    """Compose the user-side message sent to the model."""
-    if history_text:
-        return (
-            f"## Conversation History\n{history_text}\n\n"
-            f"## Current User Query\n{current_query}\n\n"
-            "Please parse the current user query based on the conversation history."
-        )
+def build_user_message(current_query: str) -> str:
+    """Compose the user-side message sent to the model (current turn only)."""
     return (
         f"## Current User Query\n{current_query}\n\n"
         "Please parse the current user query."
@@ -251,8 +245,7 @@ def main(args):
             current_query = str(c.get("content", "")).strip()
             if not current_query:
                 continue
-            history_text  = build_history_text(convs, before_turn=turn_number)
-            user_message  = build_user_message(history_text, current_query)
+            user_message  = build_user_message(current_query)
             pending_keys.append(key)
             pending_msgs.append(user_message)
 
