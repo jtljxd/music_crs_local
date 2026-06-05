@@ -216,7 +216,12 @@ def main(args):
 
     # Load dataset
     logger.info("Loading dataset '%s' split='%s' …", args.dataset, args.split)
-    if args.use_mirror:
+    if args.arrow_file:
+        # Load directly from cached arrow file
+        from datasets import Dataset
+        logger.info("Loading from arrow file: %s", args.arrow_file)
+        ds = Dataset.from_file(args.arrow_file)
+    elif args.use_mirror:
         # Load via hf-mirror parquet files (no HuggingFace API access needed)
         MIRROR_BASE = "https://hf-mirror.com/datasets"
         split_name  = args.split
@@ -275,20 +280,34 @@ def main(args):
                 max_new_tokens=args.max_new_tokens,
             )
         except torch.cuda.OutOfMemoryError:
-            # Fallback: halve batch and retry
-            logger.warning("OOM at batch_size=%d, retrying with batch_size=1 …", len(keys_batch))
+            # Fallback: halve batch size progressively
+            logger.warning("OOM at batch_size=%d, retrying with smaller batches …", len(keys_batch))
+            torch.cuda.empty_cache()
             outputs = []
-            for msg in msgs_batch:
+            sub_bs = max(1, len(keys_batch) // 4)
+            for sub_start in range(0, len(msgs_batch), sub_bs):
+                sub_msgs = msgs_batch[sub_start: sub_start + sub_bs]
                 try:
-                    out = run_inference_batch(
-                        system_prompt, [msg],
+                    sub_out = run_inference_batch(
+                        system_prompt, sub_msgs,
                         tokenizer, model, device,
                         max_new_tokens=args.max_new_tokens,
                     )
-                    outputs.append(out[0])
-                except Exception as e2:
-                    logger.warning("Single inference failed: %s", e2)
-                    outputs.append("{}")
+                    outputs.extend(sub_out)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    # Last resort: one by one
+                    for msg in sub_msgs:
+                        try:
+                            o = run_inference_batch(
+                                system_prompt, [msg],
+                                tokenizer, model, device,
+                                max_new_tokens=args.max_new_tokens,
+                            )
+                            outputs.append(o[0])
+                        except Exception as e2:
+                            logger.warning("Single inference failed: %s", e2)
+                            outputs.append("{}")
 
         for key, raw_output in zip(keys_batch, outputs):
             parsed = extract_json(raw_output)
@@ -353,6 +372,10 @@ def parse_args():
     p.add_argument(
         "--use_mirror", action="store_true",
         help="Load dataset via hf-mirror parquet URLs instead of HuggingFace API",
+    )
+    p.add_argument(
+        "--arrow_file", type=str, default=None,
+        help="Load directly from a local HuggingFace arrow cache file",
     )
     return p.parse_args()
 
