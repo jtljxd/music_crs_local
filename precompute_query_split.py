@@ -63,7 +63,7 @@ PROMPT_PATH   = "mcrs/system_prompts/query_split.txt"
 DEFAULT_MODEL = "/home/lijiatong06/music-crs-baselines/Qwen2.5-3B-Instruct/Qwen/Qwen2___5-3B-Instruct"
 
 # Maximum history turns to include in context (to avoid exceeding context length)
-MAX_HISTORY_TURNS = 10
+MAX_HISTORY_TURNS = 4   # reduced from 10 to shorten input and save KV cache
 
 
 # ─── model ────────────────────────────────────────────────────────────────────
@@ -333,7 +333,7 @@ def parse_args():
         default="qwen/query_split_train.pt",
     )
     p.add_argument(
-        "--max_new_tokens", type=int, default=256,
+        "--max_new_tokens", type=int, default=128,
         help="Max tokens for model generation",
     )
     p.add_argument(
