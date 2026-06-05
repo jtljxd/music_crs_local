@@ -216,7 +216,17 @@ def main(args):
 
     # Load dataset
     logger.info("Loading dataset '%s' split='%s' …", args.dataset, args.split)
-    ds = load_dataset(args.dataset, split=args.split)
+    if args.use_mirror:
+        # Load via hf-mirror parquet files (no HuggingFace API access needed)
+        MIRROR_BASE = "https://hf-mirror.com/datasets"
+        split_name  = args.split
+        data_files  = {
+            split_name: f"{MIRROR_BASE}/{args.dataset}/resolve/main/data/{split_name}-00000-of-00001.parquet"
+        }
+        full_ds = load_dataset("parquet", data_files=data_files)
+        ds = full_ds[split_name]
+    else:
+        ds = load_dataset(args.dataset, split=args.split)
     total = len(ds)
     logger.info("Total sessions: %d", total)
 
@@ -339,6 +349,10 @@ def parse_args():
     )
     p.add_argument(
         "--device", type=str, default="auto",
+    )
+    p.add_argument(
+        "--use_mirror", action="store_true",
+        help="Load dataset via hf-mirror parquet URLs instead of HuggingFace API",
     )
     return p.parse_args()
 
