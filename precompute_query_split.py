@@ -74,6 +74,9 @@ def load_model(model_path: str, device: str):
         model_path, trust_remote_code=True, local_files_only=True,
         use_fast=False,
     )
+    tokenizer.padding_side = "left"   # required for batch generation
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
@@ -146,24 +149,33 @@ def build_user_message(history_text: str, current_query: str) -> str:
 
 # ─── inference ────────────────────────────────────────────────────────────────
 
-def run_inference(
+def run_inference_batch(
     system_prompt: str,
-    user_message: str,
+    user_messages: List[str],
     tokenizer,
     model,
     device: str,
     max_new_tokens: int = 256,
-) -> str:
-    messages = [
-        {"role": "system",  "content": system_prompt},
-        {"role": "user",    "content": user_message},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(text, return_tensors="pt").to(device)
+) -> List[str]:
+    """Batch inference: process multiple prompts at once."""
+    texts = []
+    for user_msg in user_messages:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_msg},
+        ]
+        texts.append(tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        ))
+
+    inputs = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=2048,
+    ).to(device)
+
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -171,11 +183,15 @@ def run_inference(
             do_sample=False,
             temperature=None,
             top_p=None,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
-    # Decode only the newly generated tokens
-    new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+    results = []
+    input_len = inputs["input_ids"].shape[1]
+    for ids in output_ids:
+        new_ids = ids[input_len:]
+        results.append(tokenizer.decode(new_ids, skip_special_tokens=True).strip())
+    return results
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -213,55 +229,76 @@ def main(args):
     new_count  = 0
     error_count = 0
 
-    pbar = tqdm(range(total), desc=args.split, unit="session")
-    for idx in pbar:
+    # ── Collect all pending (key, user_message) pairs ────────────────────────
+    logger.info("Collecting pending turns …")
+    pending_keys: List[str] = []
+    pending_msgs: List[str] = []
+
+    for idx in tqdm(range(total), desc="Scanning", unit="session"):
         item       = ds[idx]
         session_id = item["session_id"]
         convs      = item.get("conversations", [])
 
-        # Find all user turns
         user_turns = sorted(
             [c for c in convs if c.get("role") == "user" and c.get("content")],
             key=lambda x: int(x["turn_number"]),
         )
-
         for c in user_turns:
-            turn_number = int(c["turn_number"])
-            key         = f"{session_id}_{turn_number}"
-
+            turn_number   = int(c["turn_number"])
+            key           = f"{session_id}_{turn_number}"
             if key in store:
-                continue  # already computed
-
+                continue
             current_query = str(c.get("content", "")).strip()
             if not current_query:
                 continue
+            history_text  = build_history_text(convs, before_turn=turn_number)
+            user_message  = build_user_message(history_text, current_query)
+            pending_keys.append(key)
+            pending_msgs.append(user_message)
 
-            history_text = build_history_text(convs, before_turn=turn_number)
-            user_message = build_user_message(history_text, current_query)
+    logger.info("%d turns to process (batch_size=%d).", len(pending_keys), args.batch_size)
 
-            try:
-                raw_output = run_inference(
-                    system_prompt, user_message,
-                    tokenizer, model, device,
-                    max_new_tokens=args.max_new_tokens,
-                )
-                parsed = extract_json(raw_output)
-                if parsed is not None:
-                    # Store as JSON string (compact)
-                    store[key] = json.dumps(parsed, ensure_ascii=False)
-                else:
-                    # Store raw string if JSON parsing fails
-                    store[key] = raw_output
-                    error_count += 1
-                new_count += 1
+    # ── Batch inference ───────────────────────────────────────────────────────
+    bs = args.batch_size
+    pbar = tqdm(range(0, len(pending_keys), bs), desc="Inference", unit="batch")
+    for start in pbar:
+        keys_batch = pending_keys[start: start + bs]
+        msgs_batch = pending_msgs[start: start + bs]
 
-            except Exception as e:
-                logger.warning("Error at %s: %s", key, e)
+        try:
+            outputs = run_inference_batch(
+                system_prompt, msgs_batch,
+                tokenizer, model, device,
+                max_new_tokens=args.max_new_tokens,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # Fallback: halve batch and retry
+            logger.warning("OOM at batch_size=%d, retrying with batch_size=1 …", len(keys_batch))
+            outputs = []
+            for msg in msgs_batch:
+                try:
+                    out = run_inference_batch(
+                        system_prompt, [msg],
+                        tokenizer, model, device,
+                        max_new_tokens=args.max_new_tokens,
+                    )
+                    outputs.append(out[0])
+                except Exception as e2:
+                    logger.warning("Single inference failed: %s", e2)
+                    outputs.append("{}")
+
+        for key, raw_output in zip(keys_batch, outputs):
+            parsed = extract_json(raw_output)
+            if parsed is not None:
+                store[key] = json.dumps(parsed, ensure_ascii=False)
+            else:
+                store[key] = raw_output
                 error_count += 1
-                store[key] = "{}"
+            new_count += 1
 
-        # Save checkpoint every N sessions
-        if (idx + 1) % args.save_every == 0:
+        # Save checkpoint every N batches
+        batches_done = (start // bs) + 1
+        if batches_done % args.save_every == 0:
             torch.save(store, out_path)
             pbar.set_postfix(new=new_count, err=error_count, saved=len(store))
 
@@ -300,8 +337,12 @@ def parse_args():
         help="Max tokens for model generation",
     )
     p.add_argument(
-        "--save_every", type=int, default=50,
-        help="Save checkpoint every N sessions",
+        "--batch_size", type=int, default=16,
+        help="Number of prompts to process in one forward pass",
+    )
+    p.add_argument(
+        "--save_every", type=int, default=20,
+        help="Save checkpoint every N batches",
     )
     p.add_argument(
         "--device", type=str, default="auto",
