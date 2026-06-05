@@ -78,9 +78,8 @@ def load_model(model_path: str, device: str):
         model_path,
         trust_remote_code=True,
         local_files_only=True,
-        torch_dtype=torch.float16 if "cuda" in device else torch.float32,
-        device_map=device,
-    ).eval()
+        dtype=torch.float16 if "cuda" in device else torch.float32,
+    ).to(device).eval()
     logger.info("Model ready.")
     return tokenizer, model
 
