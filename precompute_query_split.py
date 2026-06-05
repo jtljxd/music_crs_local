@@ -60,7 +60,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH   = "mcrs/system_prompts/query_split.txt"
-DEFAULT_MODEL = "/home/lijiatong06/music-crs-baselines/Qwen2.5-3B-Instruct"
+DEFAULT_MODEL = "/home/lijiatong06/music-crs-baselines/Qwen2.5-3B-Instruct/Qwen/Qwen2___5-3B-Instruct"
 
 # Maximum history turns to include in context (to avoid exceeding context length)
 MAX_HISTORY_TURNS = 10
