@@ -72,6 +72,7 @@ def load_model(model_path: str, device: str):
     logger.info("Loading Qwen2.5-3B-Instruct from %s (device=%s) …", model_path, device)
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, trust_remote_code=True, local_files_only=True,
+        use_fast=False,
     )
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
