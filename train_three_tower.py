@@ -77,27 +77,71 @@ def build_training_samples(
     split: str,
     turn_store: Dict[str, torch.Tensor],
 ) -> List[Dict]:
-    """One sample per (session, music-turn). All tracks = positives."""
+    """One sample per (session, music-turn).
+
+    Label assignment (with turn offset fix):
+      - conversation turn N recommends a track
+      - assessment at turn N+1 gives the feedback
+      - MOVES_TOWARD_GOAL     → label = 1.0  (positive)
+      - DOES_NOT_MOVE_TOWARD_GOAL → label = 0.0 (negative signal, still included)
+      - no assessment (last turn, no feedback) → skip
+    """
     logger.info("Loading '%s' split='%s' …", dataset_name, split)
     ds = load_dataset(dataset_name, split=split)
 
     samples, skipped = [], 0
+    label_dist = {"1.0": 0, "0.0": 0, "skipped_no_feedback": 0}
 
     for item in tqdm(ds, desc=f"Building samples [{split}]", unit="session"):
         session_id = item["session_id"]
         user_id    = item.get("user_id", None)
         convs      = item["conversations"]
+        assessments = item.get("goal_progress_assessments", [])
 
+        # Build assessment lookup: feedback_turn → gpa value
+        # feedback_turn = music_turn + 1
+        asmt_map = {
+            int(a["turn_number"]): a.get("goal_progress_assessment", None)
+            for a in assessments
+        }
+
+        # Collect music turns: turn_number → track_id
         music_turns: Dict[int, str] = {}
         for c in convs:
             if c.get("role") == "music" and c.get("content"):
                 music_turns[int(c["turn_number"])] = c["content"]
+
         if not music_turns:
             continue
 
-        session_positive_ids: Set[str] = set(music_turns.values())
+        # Only truly positive tracks for negative-sampling exclusion
+        session_positive_ids: Set[str] = {
+            tid for tn, tid in music_turns.items()
+            if asmt_map.get(tn + 1) == "MOVES_TOWARD_GOAL"
+        }
 
         for turn_number, track_id in music_turns.items():
+            # Feedback for turn N is in assessment at turn N+1
+            feedback_turn = turn_number + 1
+            if feedback_turn not in asmt_map:
+                # Last turn or no assessment → skip (no reliable label)
+                label_dist["skipped_no_feedback"] += 1
+                skipped += 1
+                continue
+
+            gpa = asmt_map[feedback_turn]
+            if gpa == "MOVES_TOWARD_GOAL":
+                label = 1.0
+                label_dist["1.0"] += 1
+            elif gpa == "DOES_NOT_MOVE_TOWARD_GOAL":
+                label = 0.0
+                label_dist["0.0"] += 1
+            else:
+                # None or unknown value → skip
+                label_dist["skipped_no_feedback"] += 1
+                skipped += 1
+                continue
+
             q_key = f"{session_id}_{turn_number}_query"
             if q_key not in turn_store:
                 skipped += 1
@@ -117,13 +161,18 @@ def build_training_samples(
                 "turn_number":          turn_number,
                 "user_id":              user_id,
                 "track_id":             track_id,
+                "label":                label,
                 "session_positive_ids": session_positive_ids,
                 "user_query":           user_query,
                 "query_emb":            query_emb,
                 "history_emb":          history_emb,
             })
 
-    logger.info("Built %d samples from '%s' (skipped %d).", len(samples), split, skipped)
+    logger.info(
+        "Built %d samples from '%s' | label=1.0: %d  label=0.0: %d  skipped: %d",
+        len(samples), split,
+        label_dist["1.0"], label_dist["0.0"], label_dist["skipped_no_feedback"],
+    )
     return samples
 
 
@@ -222,8 +271,8 @@ def collate_batch(
         labels.append(lbl)
 
     for i, s in enumerate(samples):
-        # positive
-        _add_row(s, s["track_id"], 1.0)
+        # positive or labeled negative from assessment
+        _add_row(s, s["track_id"], s["label"])
 
         # in-batch hard negatives (different session)
         diff_idx = [j for j, sid in enumerate(batch_session_ids) if sid != s["session_id"]]
