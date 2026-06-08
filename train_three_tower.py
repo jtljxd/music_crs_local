@@ -265,7 +265,7 @@ def build_training_samples(
                 weight = WEIGHT_MOVES
                 label_dist["1.0"] += 1
             elif gpa == "DOES_NOT_MOVE_TOWARD_GOAL":
-                label  = 0.0
+                label  = 1.0   # 仍为正样本，仅 loss 权重更低
                 weight = WEIGHT_NO_MOVE
                 label_dist["0.0"] += 1
             else:
