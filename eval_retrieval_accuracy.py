@@ -391,9 +391,10 @@ def evaluate(args):
         bm25_track_ids = json.load(f)
     logger.info("  BM25: %d tracks", len(bm25_track_ids))
 
-    # ── Load test dataset ─────────────────────────────────────────────────────
-    logger.info("Loading test dataset …")
-    ds = load_dataset(dataset_name, split="test")
+    # ── Load dataset ──────────────────────────────────────────────────────────
+    split_name = getattr(args, "split", "test")
+    logger.info("Loading '%s' split dataset …", split_name)
+    ds = load_dataset(dataset_name, split=split_name)
     total_sessions = len(ds)
     if args.max_sessions > 0:
         total_sessions = min(args.max_sessions, total_sessions)
@@ -421,16 +422,28 @@ def evaluate(args):
             continue
 
         for turn_number, gt_track_id in music_turns.items():
+            # music 在 turn N 推荐，用户 query 在 turn N-1（或同轮 user 角色）
+            # 先找同 turn_number 的 user turn，找不到再找 turn_number-1
             user_query = ""
+            user_turn_number = turn_number  # 用于 conv_emb / query_split key
             for c in convs:
                 if int(c["turn_number"]) == turn_number and c["role"] == "user":
                     user_query = c.get("content", "")
+                    user_turn_number = turn_number
                     break
+            if not user_query:
+                # user 在上一轮发言
+                prev_turn = turn_number - 1
+                for c in convs:
+                    if int(c["turn_number"]) == prev_turn and c["role"] == "user":
+                        user_query = c.get("content", "")
+                        user_turn_number = prev_turn
+                        break
             if not user_query:
                 continue
 
-            # conv_emb for ch3
-            emb_key  = f"{session_id}_{turn_number}"
+            # conv_emb for ch3 — key 用 user 所在 turn
+            emb_key  = f"{session_id}_{user_turn_number}"
             conv_emb = conv_emb_store.get(emb_key, None)
             if conv_emb is None:
                 conv_emb = torch.zeros(CONV_EMB_DIM)
@@ -488,7 +501,7 @@ def evaluate(args):
     lines = []
     lines.append(f"\n{'='*80}")
     lines.append(
-        f"Retrieval Accuracy Evaluation  (test split, {total_queries} queries, "
+        f"Retrieval Accuracy Evaluation  ({getattr(args,'split','test')} split, {total_queries} queries, "
         f"max_sessions={args.max_sessions})"
     )
     lines.append(f"{'='*80}")
@@ -510,7 +523,8 @@ def evaluate(args):
 
     out_dir  = os.path.join("exp", "eval")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "retrieval_accuracy.txt")
+    split_tag = getattr(args, "split", "test")
+    out_path = os.path.join(out_dir, f"retrieval_accuracy_{split_tag}.txt")
     with open(out_path, "w") as f:
         f.write(report + "\n")
     logger.info("Report saved to %s", out_path)
@@ -534,7 +548,9 @@ def parse_args():
                    default="qwen/cf_bpr_retrieval/model.pt",
                    help="Trained three-tower model checkpoint (.pt)")
     p.add_argument("--max_sessions",      type=int, default=200,
-                   help="Number of test sessions to evaluate (200 as specified)")
+                   help="Number of sessions to evaluate")
+    p.add_argument("--split",             type=str, default="test",
+                   help="Dataset split: train / test")
     return p.parse_args()
 
 
