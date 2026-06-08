@@ -42,24 +42,83 @@ CONV_EMB_DIM = 1024
 CF_BPR_DIM   = 128
 OUTPUT_DIM   = 128
 
+# must match train_three_tower.py v5
+AGE_GROUP_DIM           = 8
+GENDER_DIM              = 4
+COUNTRY_DIM             = 32
+USER_PROFILE_DIM        = AGE_GROUP_DIM + GENDER_DIM + COUNTRY_DIM   # 44
+USER_INPUT_DIM          = CF_BPR_DIM + USER_PROFILE_DIM              # 172
+ATTR_PROJ_DIM           = 64
+META_PROJ_DIM           = 64
+POP_BUCKET_DIM          = 8
+RELEASE_YEAR_BUCKET_DIM = 8
+DURATION_BUCKET_DIM     = 8
+ITEM_META_DIM           = POP_BUCKET_DIM + RELEASE_YEAR_BUCKET_DIM + DURATION_BUCKET_DIM  # 24
+ITEM_INPUT_DIM          = CF_BPR_DIM + ATTR_PROJ_DIM + META_PROJ_DIM + ITEM_META_DIM      # 280
+
 CHANNEL_NAMES = ["ch1_CF-BPR", "ch3_QwenMeta", "ch5_BM25", "ALL (union)"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Inline model (same as train_three_tower.py)
+#  Inline model — mirrors train_three_tower.py v5
 # ─────────────────────────────────────────────────────────────────────────────
 
 import torch.nn as nn
 
 
+def _hash_bucket(value: str, n: int) -> int:
+    if not value: return 0
+    return abs(hash(value)) % n
+
+def _popularity_bucket(pop) -> int:
+    try: p = float(pop)
+    except: return 0
+    if p < 10: return 1
+    if p < 20: return 2
+    if p < 35: return 3
+    if p < 50: return 4
+    if p < 65: return 5
+    if p < 80: return 6
+    return 7
+
+def _release_year_bucket(rd) -> int:
+    try: year = int(str(rd)[:4])
+    except: return 0
+    if year < 1970: return 1
+    if year < 1980: return 2
+    if year < 1990: return 3
+    if year < 2000: return 4
+    if year < 2005: return 5
+    if year < 2010: return 6
+    if year < 2015: return 7
+    return 7
+
+def _duration_bucket(d) -> int:
+    try: d = float(d)
+    except: return 0
+    if d < 60000:  return 1
+    if d < 120000: return 2
+    if d < 180000: return 3
+    if d < 210000: return 4
+    if d < 240000: return 5
+    if d < 300000: return 6
+    return 7
+
+
 class UserTower(nn.Module):
-    def __init__(self, cf_bpr_dim=CF_BPR_DIM, hidden=256, out=OUTPUT_DIM, dropout=0.2):
+    def __init__(self, input_dim=USER_INPUT_DIM, hidden=256, out=OUTPUT_DIM, dropout=0.2):
         super().__init__()
+        self.age_emb     = nn.Embedding(32,  AGE_GROUP_DIM)
+        self.gender_emb  = nn.Embedding(8,   GENDER_DIM)
+        self.country_emb = nn.Embedding(512, COUNTRY_DIM)
         self.net = nn.Sequential(
-            nn.Linear(cf_bpr_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
+            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(hidden, out),
         )
-    def forward(self, x): return self.net(x)
+    def forward(self, cf_bpr, age_idx, gender_idx, country_idx):
+        x = torch.cat([cf_bpr, self.age_emb(age_idx),
+                       self.gender_emb(gender_idx), self.country_emb(country_idx)], dim=1)
+        return self.net(x)
 
 
 class QueryTower(nn.Module):
@@ -69,43 +128,51 @@ class QueryTower(nn.Module):
             nn.Linear(conv_dim, 512), nn.BatchNorm1d(512), nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(512, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, out),
-        )
-    def forward(self, x): return self.net(x)
-
-
-class ItemTower(nn.Module):
-    def __init__(self, cf_bpr_dim=CF_BPR_DIM, hidden=256, out=OUTPUT_DIM, dropout=0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cf_bpr_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(hidden, out),
         )
     def forward(self, x): return self.net(x)
 
 
+class ItemTower(nn.Module):
+    def __init__(self, input_dim=ITEM_INPUT_DIM, hidden=256, out=OUTPUT_DIM, dropout=0.2,
+                 attr_in=1024, meta_in=1024):
+        super().__init__()
+        self.attr_proj    = nn.Linear(attr_in, ATTR_PROJ_DIM)
+        self.meta_proj    = nn.Linear(meta_in, META_PROJ_DIM)
+        self.pop_emb      = nn.Embedding(8, POP_BUCKET_DIM)
+        self.year_emb     = nn.Embedding(8, RELEASE_YEAR_BUCKET_DIM)
+        self.duration_emb = nn.Embedding(8, DURATION_BUCKET_DIM)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(hidden, out),
+        )
+    def forward(self, cf_bpr, attr_emb, meta_emb, pop_idx, year_idx, dur_idx):
+        x = torch.cat([cf_bpr, self.attr_proj(attr_emb), self.meta_proj(meta_emb),
+                       self.pop_emb(pop_idx), self.year_emb(year_idx),
+                       self.duration_emb(dur_idx)], dim=1)
+        return self.net(x)
+
+
 class CFBPRThreeTower(nn.Module):
-    def __init__(self, cf_bpr_dim=CF_BPR_DIM, conv_dim=CONV_EMB_DIM,
-                 hidden=256, out=OUTPUT_DIM, dropout=0.2, temperature=20.0):
+    def __init__(self, temperature=20.0, dropout=0.2):
         super().__init__()
         self.temperature = temperature
-        self.user_tower  = UserTower(cf_bpr_dim, hidden, out, dropout)
-        self.query_tower = QueryTower(conv_dim, hidden, out, dropout)
-        self.item_tower  = ItemTower(cf_bpr_dim, hidden, out, dropout)
-        self.gate_linear = nn.Linear(out * 2, out)
+        self.user_tower  = UserTower(USER_INPUT_DIM,  256, OUTPUT_DIM, dropout)
+        self.query_tower = QueryTower(CONV_EMB_DIM,   256, OUTPUT_DIM, dropout)
+        self.item_tower  = ItemTower(ITEM_INPUT_DIM,  256, OUTPUT_DIM, dropout)
+        self.gate_linear = nn.Linear(OUTPUT_DIM * 2, OUTPUT_DIM)
 
-    def encode_fusion(self, user_cf_bpr, conv_emb):
-        user_vec  = self.user_tower(user_cf_bpr)
-        query_vec = self.query_tower(conv_emb)
-        gate      = torch.sigmoid(self.gate_linear(
-            torch.cat([user_vec, query_vec], dim=1)
-        ))
-        fusion = gate * user_vec + (1.0 - gate) * query_vec
-        return F.normalize(fusion, p=2, dim=1)
+    def encode_fusion(self, cf_bpr_user, age_idx, gender_idx, country_idx, conv_emb):
+        u = self.user_tower(cf_bpr_user, age_idx, gender_idx, country_idx)
+        q = self.query_tower(conv_emb)
+        gate = torch.sigmoid(self.gate_linear(torch.cat([u, q], dim=1)))
+        return F.normalize(gate * u + (1 - gate) * q, p=2, dim=1)
 
-    def encode_item(self, item_cf_bpr):
-        return F.normalize(self.item_tower(item_cf_bpr), p=2, dim=1)
+    def encode_item(self, cf_bpr, attr_emb, meta_emb, pop_idx, year_idx, dur_idx):
+        return F.normalize(
+            self.item_tower(cf_bpr, attr_emb, meta_emb, pop_idx, year_idx, dur_idx),
+            p=2, dim=1,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,14 +182,11 @@ class CFBPRThreeTower(nn.Module):
 def _get_cf_bpr(embeddings: Dict, entity_id: Optional[str],
                 dim: int = CF_BPR_DIM) -> torch.Tensor:
     if entity_id and entity_id in embeddings:
-        data = embeddings[entity_id]
-        vec  = data.get("cf-bpr", None)
+        vec = embeddings[entity_id].get("cf-bpr", None)
         if vec is not None:
             v = vec.float()
-            if v.shape[0] > dim:
-                return v[:dim]
-            elif v.shape[0] < dim:
-                return F.pad(v, (0, dim - v.shape[0]))
+            if v.shape[0] > dim: return v[:dim]
+            if v.shape[0] < dim: return F.pad(v, (0, dim - v.shape[0]))
             return v
     return torch.zeros(dim, dtype=torch.float32)
 
@@ -132,45 +196,100 @@ def _raw_to_tensor(value, dim: int) -> torch.Tensor:
         return torch.zeros(dim, dtype=torch.float32)
     try:
         t = torch.tensor(value, dtype=torch.float32)
-        if t.ndim == 0 or t.numel() == 0:
-            return torch.zeros(dim, dtype=torch.float32)
-        if t.ndim > 1:
-            t = t.flatten()
-        if t.shape[0] < dim:
-            t = F.pad(t, (0, dim - t.shape[0]))
-        elif t.shape[0] > dim:
-            t = t[:dim]
+        if t.ndim == 0 or t.numel() == 0: return torch.zeros(dim, dtype=torch.float32)
+        if t.ndim > 1: t = t.flatten()
+        if t.shape[0] < dim: t = F.pad(t, (0, dim - t.shape[0]))
+        elif t.shape[0] > dim: t = t[:dim]
         return t
     except (TypeError, ValueError):
         return torch.zeros(dim, dtype=torch.float32)
 
 
-def load_embeddings(db_name: str, split_types: List[str],
-                    id_field: str = "track_id",
-                    emb_field: str = "cf-bpr") -> Dict:
+def load_track_data(track_emb_db: str, track_meta_db: str,
+                    split_types: List[str]) -> Dict:
+    """Load track CF-BPR + attr/meta embeddings + meta buckets."""
     from datasets import concatenate_datasets
-    ds = load_dataset(db_name)
-    valid_splits = [s for s in split_types if s in ds.keys()] or list(ds.keys())
-    concat_ds = concatenate_datasets([ds[s] for s in valid_splits])
-    dim = CF_BPR_DIM
-    for item in concat_ds:
-        v = item.get(emb_field)
-        if v is None:
-            continue
+    ds = load_dataset(track_emb_db)
+    valid = [s for s in split_types if s in ds.keys()] or list(ds.keys())
+    emb_ds = concatenate_datasets([ds[s] for s in valid])
+
+    cf_dim = CF_BPR_DIM
+    for item in emb_ds:
+        v = item.get("cf-bpr")
+        if v is None: continue
         try:
             t = torch.tensor(v, dtype=torch.float32)
-            if t.ndim == 1 and t.numel() > 0:
-                dim = t.shape[0]
-                break
-        except Exception:
-            pass
-    result: Dict = {}
-    for item in concat_ds:
-        eid = item[id_field]
-        v   = item.get(emb_field)
-        result[eid] = {"cf-bpr": _raw_to_tensor(v, dim)}
-    logger.info("Loaded %d '%s' embeddings (dim=%d).", len(result), id_field, dim)
-    return result
+            if t.ndim == 1: cf_dim = t.shape[0]; break
+        except Exception: pass
+
+    track_data: Dict = {}
+    for item in tqdm(emb_ds, desc="Loading track embs", unit="track"):
+        tid = item["track_id"]
+        track_data[tid] = {
+            "cf-bpr":   _raw_to_tensor(item.get("cf-bpr"), cf_dim),
+            "attr_emb": _raw_to_tensor(item.get("attributes-qwen3_embedding_0.6b"), 1024),
+            "meta_emb": _raw_to_tensor(item.get("metadata-qwen3_embedding_0.6b"),   1024),
+        }
+
+    ds_meta  = load_dataset(track_meta_db)
+    valid_m  = [s for s in split_types if s in ds_meta.keys()] or list(ds_meta.keys())
+    meta_ds  = concatenate_datasets([ds_meta[s] for s in valid_m])
+    for item in meta_ds:
+        tid = item["track_id"]
+        if tid not in track_data:
+            track_data[tid] = {"cf-bpr": torch.zeros(cf_dim),
+                               "attr_emb": torch.zeros(1024), "meta_emb": torch.zeros(1024)}
+        track_data[tid]["pop_bucket"]  = _popularity_bucket(item.get("popularity"))
+        track_data[tid]["year_bucket"] = _release_year_bucket(item.get("release_date"))
+        track_data[tid]["dur_bucket"]  = _duration_bucket(item.get("duration"))
+
+    for d in track_data.values():
+        d.setdefault("pop_bucket", 0)
+        d.setdefault("year_bucket", 0)
+        d.setdefault("dur_bucket", 0)
+
+    logger.info("Loaded %d tracks.", len(track_data))
+    return track_data
+
+
+def load_user_data(user_emb_db: str, user_meta_db: str,
+                   split_types: List[str]) -> Dict:
+    """Load user CF-BPR + profile buckets."""
+    from datasets import concatenate_datasets
+    ds = load_dataset(user_emb_db)
+    valid = [s for s in split_types if s in ds.keys()] or list(ds.keys())
+    emb_ds = concatenate_datasets([ds[s] for s in valid])
+
+    cf_dim = CF_BPR_DIM
+    for item in emb_ds:
+        v = item.get("cf-bpr")
+        if v is None: continue
+        try:
+            t = torch.tensor(v, dtype=torch.float32)
+            if t.ndim == 1: cf_dim = t.shape[0]; break
+        except Exception: pass
+
+    user_data: Dict = {}
+    for item in emb_ds:
+        uid = item["user_id"]
+        user_data[uid] = {"cf-bpr": _raw_to_tensor(item.get("cf-bpr"), cf_dim)}
+
+    ds_meta = load_dataset(user_meta_db)
+    valid_m = [s for s in split_types if s in ds_meta.keys()] or list(ds_meta.keys())
+    meta_ds = concatenate_datasets([ds_meta[s] for s in valid_m])
+    for item in meta_ds:
+        uid = item["user_id"]
+        if uid not in user_data:
+            user_data[uid] = {"cf-bpr": torch.zeros(cf_dim)}
+        user_data[uid]["age_idx"]     = _hash_bucket(str(item.get("age_group",   "") or ""), 32)
+        user_data[uid]["gender_idx"]  = _hash_bucket(str(item.get("gender",      "") or ""), 8)
+        user_data[uid]["country_idx"] = _hash_bucket(str(item.get("country_name","") or ""), 512)
+
+    for d in user_data.values():
+        d.setdefault("age_idx", 0); d.setdefault("gender_idx", 0); d.setdefault("country_idx", 0)
+
+    logger.info("Loaded %d users.", len(user_data))
+    return user_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,32 +303,32 @@ _QUERY_SPLIT_TEXT_FIELDS = [
 
 
 def retrieve_ch1_cf_bpr(
-    model: Optional[CFBPRThreeTower],
-    user_cf_bpr: torch.Tensor,
-    conv_emb: torch.Tensor,
-    item_matrix: torch.Tensor,   # [N, 128] normalised
-    track_ids:   List[str],
-    topk:        int,
+    model:        Optional[CFBPRThreeTower],
+    user_data_d:  Dict,                  # single user's data dict
+    conv_emb:     torch.Tensor,          # [1024]
+    track_data:   Dict,
+    item_matrix:  torch.Tensor,          # [N, 128] prebuilt (fallback or 3-tower)
+    track_ids:    List[str],
+    topk:         int,
 ) -> List[str]:
-    """ch1: three-tower fusion vector × item matrix cosine."""
+    """ch1: three-tower fusion × item matrix cosine."""
     if model is None:
-        # Fallback: user CF-BPR × item CF-BPR
-        u = F.normalize(user_cf_bpr.unsqueeze(0), p=2, dim=1).squeeze(0)
-        # If item_matrix col-dim != user dim, skip
-        if item_matrix.shape[1] == u.shape[0]:
-            scores  = (item_matrix * u.unsqueeze(0)).sum(dim=1)
-        else:
-            return track_ids[:topk]
+        # Fallback: raw user CF-BPR × item CF-BPR matrix
+        u = F.normalize(user_data_d.get("cf-bpr", torch.zeros(CF_BPR_DIM)).float().unsqueeze(0),
+                        p=2, dim=1).squeeze(0)
+        scores = (item_matrix * u.unsqueeze(0)).sum(dim=1)
     else:
         model.eval()
         with torch.no_grad():
-            fusion = model.encode_fusion(
-                user_cf_bpr.unsqueeze(0),
-                conv_emb.unsqueeze(0),
-            ).squeeze(0)                         # [128]
-        scores = (item_matrix * fusion.unsqueeze(0)).sum(dim=1)   # [N]
+            u_cf  = user_data_d.get("cf-bpr", torch.zeros(CF_BPR_DIM)).float().unsqueeze(0)
+            age   = torch.tensor([user_data_d.get("age_idx",     0)], dtype=torch.long)
+            gen   = torch.tensor([user_data_d.get("gender_idx",  0)], dtype=torch.long)
+            cnt   = torch.tensor([user_data_d.get("country_idx", 0)], dtype=torch.long)
+            fusion = model.encode_fusion(u_cf, age, gen, cnt,
+                                         conv_emb.unsqueeze(0)).squeeze(0)  # [128]
+        scores = (item_matrix * fusion.unsqueeze(0)).sum(dim=1)
 
-    topk   = min(topk, scores.shape[0])
+    topk    = min(topk, scores.shape[0])
     top_idx = torch.topk(scores, k=topk).indices.tolist()
     return [track_ids[i] for i in top_idx]
 
@@ -291,11 +410,15 @@ def evaluate(args):
     dataset_name = config.get(
         "conversation_dataset_name", "talkpl-ai/TalkPlayData-Challenge-Dataset"
     )
-    track_emb_db = config.get("track_emb_db_name",
+    track_emb_db  = config.get("track_emb_db_name",
                                "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings")
-    user_emb_db  = config.get("user_emb_db_name",
+    track_meta_db = config.get("item_db_name",
+                               "talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
+    user_emb_db   = config.get("user_emb_db_name",
                                "talkpl-ai/TalkPlayData-Challenge-User-Embeddings")
-    split_types  = list(config.get("track_split_types", ["all_tracks"]))
+    user_meta_db  = config.get("user_db_name",
+                               "talkpl-ai/TalkPlayData-Challenge-User-Metadata")
+    split_types   = list(config.get("track_split_types", ["all_tracks"]))
 
     # ── Load conv_emb store ───────────────────────────────────────────────────
     logger.info("Loading conv_emb_store from %s …", args.conv_emb_store)
@@ -312,13 +435,11 @@ def evaluate(args):
         )
         logger.info("  %d entries.", len(query_split_store))
 
-    # ── Load CF-BPR embeddings ────────────────────────────────────────────────
-    logger.info("Loading track CF-BPR …")
-    track_embs = load_embeddings(track_emb_db, split_types,
-                                 id_field="track_id", emb_field="cf-bpr")
-    logger.info("Loading user CF-BPR …")
-    user_embs  = load_embeddings(user_emb_db,  split_types,
-                                 id_field="user_id",  emb_field="cf-bpr")
+    # ── Load CF-BPR + rich feature embeddings ────────────────────────────────
+    logger.info("Loading track data (CF-BPR + attr/meta + buckets) …")
+    track_data = load_track_data(track_emb_db, track_meta_db, split_types)
+    logger.info("Loading user data (CF-BPR + profile) …")
+    user_data  = load_user_data(user_emb_db, user_meta_db, split_types)
 
     # ── Load or build track indices ───────────────────────────────────────────
     _idx_dir       = os.path.join("qwen", "retrieval_indices", "track_indices")
@@ -354,31 +475,31 @@ def evaluate(args):
         cf_model.eval()
         logger.info("  Model loaded.")
 
-        # If item index not yet built, build on the fly
+        # Build item index on-the-fly if not present
         if cf_item_matrix is None:
             logger.info("Building item index from model …")
-            track_ids_sorted = sorted(track_embs.keys())
+            track_ids_sorted = sorted(track_data.keys())
             item_vecs = []
             bs = 512
             with torch.no_grad():
                 for start in tqdm(range(0, len(track_ids_sorted), bs),
                                   desc="Item index", unit="batch"):
                     b_ids = track_ids_sorted[start: start + bs]
-                    b_bpr = torch.stack([track_embs[tid]["cf-bpr"] for tid in b_ids])
-                    item_vecs.append(cf_model.encode_item(b_bpr).cpu())
+                    cf   = torch.stack([track_data[t]["cf-bpr"]   for t in b_ids])
+                    attr = torch.stack([track_data[t]["attr_emb"] for t in b_ids])
+                    meta = torch.stack([track_data[t]["meta_emb"] for t in b_ids])
+                    pop  = torch.tensor([track_data[t]["pop_bucket"]  for t in b_ids], dtype=torch.long)
+                    year = torch.tensor([track_data[t]["year_bucket"] for t in b_ids], dtype=torch.long)
+                    dur  = torch.tensor([track_data[t]["dur_bucket"]  for t in b_ids], dtype=torch.long)
+                    item_vecs.append(cf_model.encode_item(cf, attr, meta, pop, year, dur).cpu())
             cf_item_matrix = torch.cat(item_vecs, dim=0)
             cf_item_ids    = track_ids_sorted
             logger.info("  Item index built: %d tracks", len(cf_item_ids))
     else:
-        logger.warning(
-            "No three-tower model found at '%s'; ch1 falls back to raw CF-BPR cosine.",
-            args.cf_model_path,
-        )
-        # Build fallback item matrix from raw CF-BPR
-        logger.info("Building fallback raw CF-BPR item matrix …")
-        cf_item_ids     = sorted(track_embs.keys())
-        cf_bpr_list     = [track_embs[tid]["cf-bpr"] for tid in cf_item_ids]
-        cf_item_matrix  = F.normalize(torch.stack(cf_bpr_list), p=2, dim=1)
+        logger.warning("No three-tower model at '%s'; ch1 falls back to raw CF-BPR.", args.cf_model_path)
+        cf_item_ids    = sorted(track_data.keys())
+        cf_bpr_list    = [track_data[tid]["cf-bpr"] for tid in cf_item_ids]
+        cf_item_matrix = F.normalize(torch.stack(cf_bpr_list), p=2, dim=1)
         logger.info("  Fallback matrix: %d tracks", len(cf_item_ids))
 
     # ── BM25 index ───────────────────────────────────────────────────────────
@@ -454,7 +575,7 @@ def evaluate(args):
                 elif conv_emb.shape[0] < CONV_EMB_DIM:
                     conv_emb = F.pad(conv_emb, (0, CONV_EMB_DIM - conv_emb.shape[0]))
 
-            user_cf_bpr = _get_cf_bpr(user_embs, user_id)
+            user_d = user_data.get(user_id, {}) if user_id else {}
 
             # query_split
             qs_raw = query_split_store.get(emb_key, None) if query_split_store else None
@@ -469,8 +590,8 @@ def evaluate(args):
             max_k = max(TOPK_LIST)
 
             ch1_all = retrieve_ch1_cf_bpr(
-                cf_model, user_cf_bpr, conv_emb,
-                cf_item_matrix, cf_item_ids, max_k,
+                cf_model, user_d, conv_emb,
+                track_data, cf_item_matrix, cf_item_ids, max_k,
             )
             ch3_all = retrieve_ch3_metadata(
                 conv_emb, metadata_matrix, meta_track_ids, max_k
