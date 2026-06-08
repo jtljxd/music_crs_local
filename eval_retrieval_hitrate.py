@@ -4,21 +4,23 @@ eval_retrieval_hitrate.py
 Evaluate per-channel hit rate on the test split.
 
 For each (session, turn) where the ground-truth is a music track:
-  - Run each of the 6 retrieval channels independently
+  - Run each of the 3 retrieval channels independently
   - Check if the ground-truth track_id is in the channel's results
   - Report hit rate per channel and for the union of all channels
 
-Output: a Markdown table printed to stdout + saved to
-        exp/eval/retrieval_hitrate.md
+Output: a text table printed to stdout + saved to
+        exp/eval/retrieval_hitrate.txt
 
 Usage:
     python eval_retrieval_hitrate.py \
         --config config/llama1b_multi_channel_devset.yaml \
-        --turn_store qwen/dialogue_embeddings_test_0.6b.pt \
-        --max_sessions 0          # 0 = all sessions
+        --conv_emb_store qwen/hist_conversation_embeddings_test_0.6b.pt \
+        --query_split_store qwen/query_split_test.pt \
+        --max_sessions 0
 """
 
 import argparse
+import json
 import logging
 import os
 from collections import defaultdict
@@ -35,9 +37,7 @@ from mcrs.retrieval_modules.multi_channel_retrieval import (
     MultiChannelRetrieval,
     USER_MUSIC_TOWER_RECALL_NUM,
     QUERY_METADATA_RECALL_NUM,
-    QUERY_ATTRIBUTES_RECALL_NUM,
     BM25_RECALL_NUM,
-    BERT_RECALL_NUM,
 )
 
 logging.basicConfig(
@@ -51,11 +51,8 @@ EMB_DIM = 1024
 
 CHANNEL_NAMES = [
     "ch1_CF-BPR",
-    "ch2_SimilarUsers",
     "ch3_QwenMeta",
-    "ch4_QwenAttr",
     "ch5_BM25",
-    "ch6_Semantic",
     "ALL (union)",
 ]
 
@@ -76,15 +73,19 @@ def per_channel_retrieve(
     user_id: Optional[str],
     current_query: str,
     query_emb: torch.Tensor,
+    session_id: Optional[str] = None,
+    turn_number: Optional[int] = None,
 ):
-    """Run each channel independently; return list of 6 candidate lists."""
+    """Run each channel independently; return list of 3 candidate lists."""
     ch1 = retrieval._retrieve_cf_bpr(user_id, USER_MUSIC_TOWER_RECALL_NUM)
-    ch2 = retrieval._retrieve_similar_users_music(user_id)
     ch3 = retrieval._retrieve_query_metadata(query_emb, QUERY_METADATA_RECALL_NUM)
-    ch4 = retrieval._retrieve_query_attributes(query_emb, QUERY_ATTRIBUTES_RECALL_NUM)
-    ch5 = retrieval._retrieve_bm25(current_query, BM25_RECALL_NUM)
-    ch6 = retrieval._retrieve_bert(current_query, BERT_RECALL_NUM)
-    return [ch1, ch2, ch3, ch4, ch5, ch6]
+    ch5 = retrieval._retrieve_bm25(
+        current_query,
+        BM25_RECALL_NUM,
+        session_id=session_id,
+        turn_number=turn_number,
+    )
+    return [ch1, ch3, ch5]
 
 
 def evaluate(args):
@@ -98,12 +99,22 @@ def evaluate(args):
         "conversation_dataset_name", "talkpl-ai/TalkPlayData-Challenge-Dataset"
     )
 
-    # ── Load turn store ──────────────────────────────────────────────────────
-    logger.info("Loading turn store from %s …", args.turn_store)
-    turn_store = torch.load(args.turn_store, map_location="cpu", weights_only=True)
-    logger.info("  %d entries loaded.", len(turn_store))
+    # ── Load stores ──────────────────────────────────────────────────────────
+    logger.info("Loading conv_emb_store from %s …", args.conv_emb_store)
+    conv_emb_store = torch.load(args.conv_emb_store, map_location="cpu", weights_only=True)
+    logger.info("  %d entries loaded.", len(conv_emb_store))
 
-    # ── Init retrieval (load-only, indices already built) ────────────────────
+    query_split_store = None
+    if args.query_split_store and os.path.exists(args.query_split_store):
+        logger.info("Loading query_split_store from %s …", args.query_split_store)
+        query_split_store = torch.load(
+            args.query_split_store, map_location="cpu", weights_only=True
+        )
+        logger.info("  %d entries loaded.", len(query_split_store))
+    else:
+        logger.warning("No query_split_store provided; ch5 will use raw query text.")
+
+    # ── Init retrieval ────────────────────────────────────────────────────────
     logger.info("Initializing MultiChannelRetrieval (build_indices=False) …")
     qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
     qwen_model     = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
@@ -121,12 +132,14 @@ def evaluate(args):
         split_types       = list(config.get("track_split_types", ["all_tracks"])),
         cache_dir         = cache_dir,
         qwen_model_path   = qwen_model_path,
-        device            = "cpu",   # eval on CPU (no LLM needed)
+        device            = "cpu",
         qwen_model        = qwen_model,
         qwen_tokenizer    = qwen_tokenizer,
-        build_indices     = False,   # indices already built during training
+        build_indices     = False,
+        conv_emb_store    = conv_emb_store,
     )
-    retrieval.set_turn_store(turn_store)
+    if query_split_store is not None:
+        retrieval.set_query_split_store(query_split_store)
     logger.info("Retrieval ready.")
 
     # ── Load test dataset ────────────────────────────────────────────────────
@@ -138,9 +151,9 @@ def evaluate(args):
     logger.info("Evaluating on %d sessions.", total_sessions)
 
     # ── Stats ────────────────────────────────────────────────────────────────
-    total_queries   = 0
-    hits            = defaultdict(int)   # channel_name → hit count
-    ch_sizes        = defaultdict(list)  # channel_name → recall sizes
+    total_queries = 0
+    hits          = defaultdict(int)
+    ch_sizes      = defaultdict(list)
 
     for idx in tqdm(range(total_sessions), desc="Eval", unit="session"):
         item       = ds[idx]
@@ -148,7 +161,6 @@ def evaluate(args):
         user_id    = item.get("user_id", None)
         convs      = item["conversations"]
 
-        # Find all (turn, gt_track) pairs
         music_turns = {
             int(c["turn_number"]): c["content"]
             for c in convs
@@ -158,7 +170,6 @@ def evaluate(args):
             continue
 
         for turn_number, gt_track_id in music_turns.items():
-            # Get user query text
             user_query = ""
             for c in convs:
                 if int(c["turn_number"]) == turn_number and c["role"] == "user":
@@ -167,22 +178,20 @@ def evaluate(args):
             if not user_query:
                 continue
 
-            # Get query/history emb from turn store
-            q_key = f"{session_id}_{turn_number}_query"
-            h_key = f"{session_id}_{turn_number}_history"
-            query_emb   = _get_emb(turn_store, q_key)
-            hist_emb    = _get_emb(turn_store, h_key)
-            blended_emb = F.normalize(0.7 * query_emb + 0.3 * hist_emb, p=2, dim=0)
+            # Resolve query_emb from conv_emb_store (ch3 uses 1024d directly)
+            key = f"{session_id}_{turn_number}"
+            query_emb = _get_emb(conv_emb_store, key)
+            query_emb = F.normalize(query_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
 
-            # Per-channel retrieval
             channels = per_channel_retrieve(
-                retrieval, user_id, user_query, blended_emb
+                retrieval, user_id, user_query, query_emb,
+                session_id=session_id, turn_number=turn_number,
             )
 
             total_queries += 1
             union: Set[str] = set()
 
-            for ch_idx, (name, cands) in enumerate(zip(CHANNEL_NAMES[:6], channels)):
+            for ch_idx, (name, cands) in enumerate(zip(CHANNEL_NAMES[:3], channels)):
                 ch_sizes[name].append(len(cands))
                 if gt_track_id in cands:
                     hits[name] += 1
@@ -216,8 +225,7 @@ def evaluate(args):
     report = "\n".join(lines)
     print(report)
 
-    # Save to file
-    out_dir = os.path.join("exp", "eval")
+    out_dir  = os.path.join("exp", "eval")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "retrieval_hitrate.txt")
     with open(out_path, "w") as f:
@@ -226,13 +234,17 @@ def evaluate(args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate per-channel retrieval hit rate")
-    p.add_argument("--config",       type=str,
+    p = argparse.ArgumentParser(description="Evaluate per-channel retrieval hit rate (v2)")
+    p.add_argument("--config",             type=str,
                    default="config/llama1b_multi_channel_devset.yaml")
-    p.add_argument("--turn_store",   type=str,
-                   default="qwen/dialogue_embeddings_test_0.6b.pt")
-    p.add_argument("--max_sessions", type=int, default=0,
-                   help="0 = evaluate all sessions")
+    p.add_argument("--conv_emb_store",     type=str,
+                   default="qwen/hist_conversation_embeddings_test_0.6b.pt",
+                   help="hist_conversation_embeddings for ch3 (1024d, key={sid}_{turn})")
+    p.add_argument("--query_split_store",  type=str,
+                   default="qwen/query_split_test.pt",
+                   help="query_split store for ch5 BM25 keywords")
+    p.add_argument("--max_sessions",       type=int, default=0,
+                   help="0 = all sessions")
     return p.parse_args()
 
 

@@ -167,7 +167,7 @@ def run_inference_batch(
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=2048,
+        max_length=512,
     ).to(device)
 
     with torch.no_grad():
@@ -273,6 +273,7 @@ def main(args):
         keys_batch = pending_keys[start: start + bs]
         msgs_batch = pending_msgs[start: start + bs]
 
+        torch.cuda.empty_cache()  # free fragmented memory before each batch
         try:
             outputs = run_inference_batch(
                 system_prompt, msgs_batch,

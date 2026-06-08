@@ -1,23 +1,19 @@
-"""Multi-channel retrieval module for music recommendation.
+"""Multi-channel retrieval module for music recommendation (v2).
 
-This module implements a comprehensive retrieval strategy combining:
-1. User CF-BPR embedding similarity (user-music tower)
-2. Collaborative filtering based on similar users' liked music
-3. Query-metadata semantic similarity (Qwen3)
-4. Query-attributes semantic similarity (Qwen3)
-5. BM25 text matching
-6. BERT semantic embedding matching
+Remaining channels after refactor:
+  ch1_CF-BPR   : Three-tower model (User+Query gate fusion vs Item CF-BPR)
+  ch3_QwenMeta : hist_conversation_embeddings (1024d) × metadata-qwen3_embedding_0.6b, top-200
+  ch5_BM25     : Keyword-based BM25 from query_split, top-200 split evenly across non-empty keys
 
-Missing / empty embeddings are stored as zero-vectors of the expected dimension
-so that every track/user remains in the index.  The reranker layer uses
-learnable UNK parameters to replace those zero-vectors during training and
-inference.
+Removed:
+  ch2_SimilarUsers  (deleted)
+  ch4_QwenAttr      (deleted)
+  ch6_Semantic      (deleted)
 """
 
 import os
 import json
 import logging
-from functools import lru_cache
 from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 
@@ -31,14 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 # ── retrieval hyper-parameters ──────────────────────────────────────────────
-USER_HISTORY_LIKE_MUSIC_NUM  = 5
-USER_MUSIC_TOWER_RECALL_NUM  = 100
-QUERY_METADATA_RECALL_NUM    = 100
-QUERY_ATTRIBUTES_RECALL_NUM  = 100
-BM25_RECALL_NUM              = 100
-BERT_RECALL_NUM              = 100
+USER_MUSIC_TOWER_RECALL_NUM  = 100   # ch1 – retained for compat; actual recall done by 3-tower
+QUERY_METADATA_RECALL_NUM    = 200   # ch3 – expanded from 100 → 200
+BM25_RECALL_NUM              = 200   # ch5 – expanded from 100 → 200
 
-# canonical embedding dimensions (filled in after the first valid row is seen)
+# canonical embedding dimensions
 _TRACK_MODAL_COLS = [
     "cf-bpr",
     "audio-laion_clap",
@@ -49,9 +42,15 @@ _TRACK_MODAL_COLS = [
 ]
 _USER_MODAL_COLS = ["cf-bpr"]
 
+# Query-split fields used for BM25 keyword search
+_QUERY_SPLIT_TEXT_FIELDS = [
+    "artist", "album", "genre", "decade", "language",
+    "popularity", "scene", "tempo",
+]
+
 
 class MultiChannelRetrieval:
-    """Multi-channel retrieval combining CF, collaborative filtering, and semantic search."""
+    """3-channel retrieval: CF-BPR three-tower, QwenMeta semantic, BM25 keyword."""
 
     def __init__(
         self,
@@ -65,9 +64,11 @@ class MultiChannelRetrieval:
         qwen_model_path: str = "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
         device: str = "cuda",
         batch_size: int = 32,
-        qwen_model=None,       # pre-loaded shared instance (optional)
-        qwen_tokenizer=None,   # pre-loaded shared instance (optional)
-        build_indices: bool = True,  # False during inference (load-only)
+        qwen_model=None,
+        qwen_tokenizer=None,
+        build_indices: bool = True,
+        # Optional pre-loaded hist_conversation_embeddings for ch3
+        conv_emb_store: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self.dataset_name    = dataset_name
         self.item_db_name    = item_db_name
@@ -88,10 +89,15 @@ class MultiChannelRetrieval:
         self.track_embeddings = self._load_track_embeddings(track_emb_db_name, split_types)
         self.user_embeddings  = self._load_user_embeddings(user_emb_db_name, split_types)
 
-        logger.info("Building user history index …")
-        self.user_liked_music = self._build_user_history_index(dataset_name, split_types)
+        # Optionally accept pre-loaded hist_conv_emb store (used by ch3)
+        self._conv_emb_store: Optional[Dict[str, torch.Tensor]] = conv_emb_store
 
-        # Use shared Qwen model if provided; otherwise load from disk on CPU
+        # Turn store (query/history emb per session-turn)
+        self._turn_store: Optional[Dict[str, torch.Tensor]] = None
+        # Query-split store ({session_id}_{turn} → json str)
+        self._query_split_store: Optional[Dict[str, str]] = None
+
+        # Qwen model (used as fallback encoder for ch3 if no conv_emb_store)
         if qwen_model is not None and qwen_tokenizer is not None:
             logger.info("Using shared Qwen model (CPU).")
             self.tokenizer  = qwen_tokenizer
@@ -110,28 +116,10 @@ class MultiChannelRetrieval:
         logger.info("%s BM25 index …", "Building" if build_indices else "Loading")
         self._build_bm25_index(build=build_indices)
 
-        # ── Semantic index (Channel 6, Qwen3-0.6B) ───────────────────────
-        logger.info("%s semantic embedding index …", "Building" if build_indices else "Loading")
-        _bert_model_name = qwen_model_path
-        self._bert_tokenizer = AutoTokenizer.from_pretrained(
-            _bert_model_name, use_fast=True
-        )
-        self._bert_model = AutoModel.from_pretrained(_bert_model_name).eval()
-        self._bert_device = device
-        self._bert_model.to(self._bert_device)
-        self._build_bert_index(build=build_indices)
-
     # ── helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _raw_to_tensor(value, dim: int) -> torch.Tensor:
-        """Convert a raw dataset value to a float32 tensor of length *dim*.
-
-        * If the value is None / empty / wrong type → return a zero-vector.
-        * If the resulting 1-D tensor is shorter than *dim*   → zero-pad.
-        * If it is longer than *dim*                          → truncate.
-        The caller decides what *dim* should be (inferred from first valid row).
-        """
         if value is None:
             return torch.zeros(dim, dtype=torch.float32)
         try:
@@ -163,18 +151,12 @@ class MultiChannelRetrieval:
                 for item in concatenate_datasets([ds[s] for s in valid_splits])}
 
     def _load_track_embeddings(self, dataset_name: str, split_types: List[str]) -> Dict:
-        """Load track embeddings.
-
-        Every track is kept in the dictionary.  Missing / malformed columns are
-        stored as zero-vectors of the canonical dimension so that downstream
-        ``torch.stack`` calls are always safe.  The *missing* flag lets the
-        reranker replace zero-vectors with its learnable UNK parameters.
-        """
+        """Load track embeddings, zero-filling missing columns."""
         ds = load_dataset(dataset_name)
         valid_splits = [s for s in split_types if s in ds.keys()] or list(ds.keys())
         concat_ds = concatenate_datasets([ds[s] for s in valid_splits])
 
-        # First pass: discover canonical dimensions from first valid row per column
+        # First pass: discover canonical dimensions
         col_dims: Dict[str, int] = {}
         for item in concat_ds:
             for col in _TRACK_MODAL_COLS:
@@ -192,16 +174,14 @@ class MultiChannelRetrieval:
             if len(col_dims) == len(_TRACK_MODAL_COLS):
                 break
 
-        # Fall back if a column is entirely missing from the dataset
         for col in _TRACK_MODAL_COLS:
             if col not in col_dims:
                 col_dims[col] = 128
-                logger.warning("Column '%s' not found in track embeddings; defaulting dim to 128.", col)
+                logger.warning("Column '%s' missing; defaulting dim to 128.", col)
 
-        self.track_col_dims = col_dims  # expose for reranker
+        self.track_col_dims = col_dims
         logger.info("Track embedding dims: %s", col_dims)
 
-        # Second pass: build the dict, zero-filling missing values
         embeddings: Dict[str, Dict] = {}
         missing_counts: Dict[str, int] = defaultdict(int)
         for item in concat_ds:
@@ -212,28 +192,25 @@ class MultiChannelRetrieval:
                 v = item.get(col)
                 t = self._raw_to_tensor(v, col_dims[col])
                 row[col] = t
-                if v is None or (not isinstance(v, (list, tuple)) and v != v):  # noqa: comparison-with-itself detects NaN
+                if v is None or (isinstance(v, (list, tuple)) and len(v) == 0):
                     missing_cols.append(col)
                     missing_counts[col] += 1
-                elif isinstance(v, (list, tuple)) and len(v) == 0:
-                    missing_cols.append(col)
-                    missing_counts[col] += 1
-            row["__missing__"] = missing_cols  # track which modalities were absent
+            row["__missing__"] = missing_cols
             embeddings[track_id] = row
 
         for col, cnt in missing_counts.items():
             if cnt:
-                logger.warning("Track col '%s': %d / %d rows were missing → zero-filled.", col, cnt, len(embeddings))
-        logger.info("Loaded %d tracks (zero-fill for missing modalities).", len(embeddings))
+                logger.warning("Track col '%s': %d / %d rows missing → zero-filled.",
+                               col, cnt, len(embeddings))
+        logger.info("Loaded %d tracks.", len(embeddings))
         return embeddings
 
     def _load_user_embeddings(self, dataset_name: str, split_types: List[str]) -> Dict:
-        """Load user embeddings; zero-fill missing cf-bpr."""
+        """Load user CF-BPR embeddings."""
         ds = load_dataset(dataset_name)
         valid_splits = [s for s in split_types if s in ds.keys()] or list(ds.keys())
         concat_ds = concatenate_datasets([ds[s] for s in valid_splits])
 
-        # Discover dimension
         cf_bpr_dim = 128
         for item in concat_ds:
             v = item.get("cf-bpr")
@@ -247,7 +224,7 @@ class MultiChannelRetrieval:
             except Exception:
                 pass
 
-        self.user_cf_bpr_dim = cf_bpr_dim  # expose for reranker
+        self.user_cf_bpr_dim = cf_bpr_dim
         logger.info("User cf-bpr dim: %d", cf_bpr_dim)
 
         embeddings: Dict[str, Dict] = {}
@@ -260,94 +237,29 @@ class MultiChannelRetrieval:
             if is_missing:
                 missing += 1
             embeddings[user_id] = {
-                "cf-bpr":     t,
+                "cf-bpr":      t,
                 "__missing__": ["cf-bpr"] if is_missing else [],
             }
 
         if missing:
-            logger.warning("User cf-bpr: %d / %d rows missing → zero-filled.", missing, len(embeddings))
+            logger.warning("User cf-bpr: %d / %d rows missing → zero-filled.",
+                           missing, len(embeddings))
         logger.info("Loaded %d users.", len(embeddings))
-
-        # Pre-build stacked matrix for fast nearest-user search.
-        # Only use rows that have real embeddings (non-zero) for reliable similarity.
-        valid_ids   = [uid for uid, d in embeddings.items() if not d["__missing__"]]
-        invalid_ids = [uid for uid, d in embeddings.items() if d["__missing__"]]
-
-        if valid_ids:
-            stacked = torch.stack([embeddings[uid]["cf-bpr"] for uid in valid_ids])
-            stacked = F.normalize(stacked, p=2, dim=1)
-            self._user_ids_ordered  = valid_ids
-            self._user_emb_matrix   = stacked
-        else:
-            self._user_ids_ordered  = []
-            self._user_emb_matrix   = None
-
-        if invalid_ids:
-            logger.warning("%d users have missing cf-bpr; excluded from nearest-user search.", len(invalid_ids))
-
         return embeddings
-
-    # ── user history ─────────────────────────────────────────────────────────
-
-    def _build_user_history_index(
-        self, dataset_name: str, split_types: List[str]
-    ) -> Dict[str, List[Tuple[str, float]]]:
-        """user_id -> [(track_id, like_score), …] sorted by preference."""
-        cache_path = os.path.join(self.index_dir, "user_liked_music.json")
-        if os.path.exists(cache_path):
-            logger.info("Loading user history index from %s", cache_path)
-            with open(cache_path) as f:
-                data = json.load(f)
-            return {k: [tuple(v) for v in vals] for k, vals in data.items()}
-
-        logger.info("Building user history index …")
-        ds = load_dataset(dataset_name)
-        valid_splits = [s for s in split_types if s in ds.keys()] or list(ds.keys())
-
-        user_history: Dict[str, List] = defaultdict(list)
-        for split in valid_splits:
-            for session in ds[split]:
-                user_id      = session["user_id"]
-                conversations = session["conversations"]
-                assessments  = session.get("goal_progress_assessments", [])
-                assessment_map = {a["turn_number"]: a for a in assessments}
-                for conv in conversations:
-                    if conv["role"] != "music":
-                        continue
-                    turn_num    = conv["turn_number"]
-                    track_id    = conv["content"]
-                    asmt        = assessment_map.get(turn_num, {})
-                    gpa         = asmt.get("goal_progress_assessment", "")
-                    like_score  = 5.0 if gpa == "MOVES_TOWARD_GOAL" else 1.0
-                    user_history[user_id].append((track_id, like_score, turn_num))
-
-        user_liked_music: Dict[str, List] = {}
-        for uid, history in user_history.items():
-            sorted_h = sorted(history, key=lambda x: (-x[1], -x[2]))
-            user_liked_music[uid] = [
-                (tid, score) for tid, score, _ in sorted_h[:USER_HISTORY_LIKE_MUSIC_NUM]
-            ]
-
-        with open(cache_path, "w") as f:
-            json.dump(user_liked_music, f)
-        logger.info("User history index saved to %s", cache_path)
-        return user_liked_music
 
     # ── index build ──────────────────────────────────────────────────────────
 
     def _build_track_indices(self, build: bool = True):
-        """Build or load CF-BPR / metadata / attributes matrices."""
-        _idx_dir        = os.path.join("qwen", "retrieval_indices", "track_indices")
-        cf_bpr_path     = os.path.join(_idx_dir, "track_cf_bpr.pt")
-        metadata_path   = os.path.join(_idx_dir, "track_metadata_1024.pt")
-        attributes_path = os.path.join(_idx_dir, "track_attributes_1024.pt")
-        track_ids_path  = os.path.join(_idx_dir, "track_ids.json")
+        """Build or load CF-BPR / metadata matrices."""
+        _idx_dir      = os.path.join("qwen", "retrieval_indices", "track_indices")
+        cf_bpr_path   = os.path.join(_idx_dir, "track_cf_bpr.pt")
+        metadata_path = os.path.join(_idx_dir, "track_metadata_1024.pt")
+        track_ids_path = os.path.join(_idx_dir, "track_ids.json")
 
-        if all(os.path.exists(p) for p in [cf_bpr_path, metadata_path, attributes_path, track_ids_path]):
+        if all(os.path.exists(p) for p in [cf_bpr_path, metadata_path, track_ids_path]):
             logger.info("Loading pre-computed track indices …")
-            self.track_cf_bpr_matrix     = torch.load(cf_bpr_path,     map_location="cpu")
-            self.track_metadata_matrix   = torch.load(metadata_path,   map_location="cpu")
-            self.track_attributes_matrix = torch.load(attributes_path, map_location="cpu")
+            self.track_cf_bpr_matrix   = torch.load(cf_bpr_path,   map_location="cpu")
+            self.track_metadata_matrix = torch.load(metadata_path, map_location="cpu")
             with open(track_ids_path) as f:
                 self.track_ids_list = json.load(f)
             logger.info("Loaded index for %d tracks.", len(self.track_ids_list))
@@ -365,50 +277,50 @@ class MultiChannelRetrieval:
         track_ids = sorted(self.track_embeddings.keys())
         self.track_ids_list = track_ids
 
-        cf_bpr_list     = []
-        metadata_list   = []
-        attributes_list = []
+        cf_bpr_list   = []
+        metadata_list = []
 
         for tid in track_ids:
             embs = self.track_embeddings[tid]
             cf_bpr_list.append(embs["cf-bpr"])
-            # Take first 1024 dims (zero-pad if shorter)
-            meta  = embs["metadata-qwen3_embedding_0.6b"]
-            attr  = embs["attributes-qwen3_embedding_0.6b"]
+            meta = embs["metadata-qwen3_embedding_0.6b"]
             metadata_list.append(self._raw_to_tensor(meta.tolist(), 1024))
-            attributes_list.append(self._raw_to_tensor(attr.tolist(), 1024))
 
-        self.track_cf_bpr_matrix     = F.normalize(torch.stack(cf_bpr_list),     p=2, dim=1)
-        self.track_metadata_matrix   = F.normalize(torch.stack(metadata_list),   p=2, dim=1)
-        self.track_attributes_matrix = F.normalize(torch.stack(attributes_list), p=2, dim=1)
+        self.track_cf_bpr_matrix   = F.normalize(torch.stack(cf_bpr_list),   p=2, dim=1)
+        self.track_metadata_matrix = F.normalize(torch.stack(metadata_list), p=2, dim=1)
 
-        torch.save(self.track_cf_bpr_matrix,     cf_bpr_path)
-        torch.save(self.track_metadata_matrix,   metadata_path)
-        torch.save(self.track_attributes_matrix, attributes_path)
+        torch.save(self.track_cf_bpr_matrix,   cf_bpr_path)
+        torch.save(self.track_metadata_matrix, metadata_path)
         with open(track_ids_path, "w") as f:
             json.dump(self.track_ids_list, f)
 
         logger.info("Track indices saved. Total: %d tracks.", len(track_ids))
 
-    # ── query encoding ───────────────────────────────────────────────────────
+    # ── store injection ──────────────────────────────────────────────────────
 
     def set_turn_store(self, store: dict):
-        """Inject a pre-computed turn embedding store.
-
-        store: dict  key='{session_id}__{turn}_{role}'  value=float16 [128]
-        Once set, retrieve() can skip all Qwen calls when session_id+turn_number
-        are provided.
-        """
+        """Inject pre-computed turn embedding store (query/history per session-turn)."""
         self._turn_store = store
-        logger.info("Turn store injected into MultiChannelRetrieval (%d entries).", len(store))
+        logger.info("Turn store injected (%d entries).", len(store))
 
-    # kept for fallback / standalone use
-    def set_embedding_cache(self, cache):
-        """Inject a pre-computed QwenEmbeddingCache (legacy; prefer set_turn_store)."""
-        self._qwen_cache = cache
-        logger.info("QwenEmbeddingCache injected into MultiChannelRetrieval (%d entries).", len(cache))
+    def set_conv_emb_store(self, store: Dict[str, torch.Tensor]):
+        """Inject hist_conversation_embeddings store for ch3.
 
-    # Qwen3-Embedding instruction prefix
+        Key format: {session_id}_{turn_number}   value: 1024-dim tensor
+        """
+        self._conv_emb_store = store
+        logger.info("Conv-emb store injected (%d entries).", len(store))
+
+    def set_query_split_store(self, store: Dict[str, str]):
+        """Inject query_split store for ch5 keyword BM25.
+
+        Key format: {session_id}_{turn_number}   value: JSON string of query-split dict
+        """
+        self._query_split_store = store
+        logger.info("Query-split store injected (%d entries).", len(store))
+
+    # ── Qwen query encoding (fallback) ───────────────────────────────────────
+
     _QWEN_TASK = "Given a music conversation query, retrieve relevant music tracks"
 
     @staticmethod
@@ -417,15 +329,9 @@ class MultiChannelRetrieval:
         return last_hidden[torch.arange(last_hidden.shape[0], device=last_hidden.device), seq_len]
 
     def _encode_query(self, query: str) -> torch.Tensor:
-        """Encode query; look up pre-computed cache first, fall back to Qwen model."""
+        """Encode a query to 1024-dim via Qwen (fallback; no cache lookup)."""
         if not query or not query.strip():
-            return torch.zeros(256)
-
-        # 1. Pre-computed cache (fastest path)
-        if hasattr(self, "_qwen_cache") and self._qwen_cache is not None:
-            return self._qwen_cache.get(query, dim=256, normalize=True)
-
-        # 2. Per-instance runtime text cache
+            return torch.zeros(1024)
         if not hasattr(self, "_encode_cache"):
             self._encode_cache: Dict[str, torch.Tensor] = {}
         if query in self._encode_cache:
@@ -440,74 +346,60 @@ class MultiChannelRetrieval:
             )
             outputs = self.qwen_model(**inputs)
             emb = self._last_token_pool(outputs.last_hidden_state,
-                                        inputs["attention_mask"])  # [1, H]
-            emb = F.normalize(emb[:, :256], p=2, dim=1).squeeze(0).float()
+                                        inputs["attention_mask"])   # [1, H]
+            emb = F.normalize(emb[:, :1024], p=2, dim=1).squeeze(0).float()
 
         if len(self._encode_cache) >= 8192:
             self._encode_cache.clear()
         self._encode_cache[query] = emb
         return emb
 
-    # ── retrieval channels ───────────────────────────────────────────────────
+    # ── Channel 1: CF-BPR (user CF-BPR × track CF-BPR) ──────────────────────
 
     def _retrieve_cf_bpr(self, user_id: Optional[str], topk: int) -> List[str]:
-        """Channel 1: user CF-BPR × track CF-BPR cosine similarity."""
+        """Channel 1: user CF-BPR × track CF-BPR cosine similarity.
+
+        During inference (before three-tower model is used), falls back to
+        simple user-CF vs item-CF cosine similarity.
+        """
         if (user_id is None
                 or user_id not in self.user_embeddings
                 or self.user_embeddings[user_id]["__missing__"]):
             return self.track_ids_list[:topk]
 
         user_bpr = self.user_embeddings[user_id]["cf-bpr"]
-        user_bpr = F.normalize(user_bpr.unsqueeze(0), p=2, dim=1)  # [1, D]
+        user_bpr = F.normalize(user_bpr.unsqueeze(0), p=2, dim=1)
         scores   = torch.matmul(self.track_cf_bpr_matrix, user_bpr.T).squeeze(1)
         topk     = min(topk, scores.shape[0])
         top_idx  = torch.topk(scores, k=topk).indices.tolist()
         return [self.track_ids_list[i] for i in top_idx]
 
-    def _retrieve_similar_users_music(self, user_id: Optional[str]) -> List[str]:
-        """Channel 2: liked music from the 10 nearest users (by cf-bpr)."""
-        if (user_id is None
-                or user_id not in self.user_embeddings
-                or self.user_embeddings[user_id]["__missing__"]
-                or self._user_emb_matrix is None):
-            return []
+    # ── Channel 3: QwenMeta (hist_conv_emb 1024d × metadata-qwen3) ──────────
 
-        user_bpr = self.user_embeddings[user_id]["cf-bpr"]
-        user_bpr = F.normalize(user_bpr.unsqueeze(0), p=2, dim=1)  # [1, D]
-        scores   = torch.matmul(self._user_emb_matrix, user_bpr.T).squeeze(1)  # [M]
+    def _retrieve_query_metadata(
+        self,
+        query_emb: torch.Tensor,
+        topk: int,
+    ) -> List[str]:
+        """Channel 3: 1024-dim conversation/query emb × metadata-qwen3_embedding_0.6b."""
+        if query_emb.shape[0] != self.track_metadata_matrix.shape[1]:
+            # Pad or truncate to match index dimension
+            dim = self.track_metadata_matrix.shape[1]
+            if query_emb.shape[0] > dim:
+                query_emb = query_emb[:dim]
+            else:
+                query_emb = F.pad(query_emb, (0, dim - query_emb.shape[0]))
 
-        # Zero out own score
-        if user_id in self._user_ids_ordered:
-            scores[self._user_ids_ordered.index(user_id)] = -1.0
-
-        top_10  = min(10, scores.shape[0])
-        top_idx = torch.topk(scores, k=top_10).indices.tolist()
-        similar = [self._user_ids_ordered[i] for i in top_idx]
-
-        liked: Set[str] = set()
-        for sim_uid in similar:
-            for tid, _ in self.user_liked_music.get(sim_uid, []):
-                liked.add(tid)
-        return list(liked)
-
-    def _retrieve_query_metadata(self, query_emb: torch.Tensor, topk: int) -> List[str]:
-        """Channel 3: query × metadata-qwen3 (256 dims)."""
-        scores  = torch.matmul(self.track_metadata_matrix, query_emb.unsqueeze(1)).squeeze(1)
+        q = F.normalize(query_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
+        scores  = torch.matmul(self.track_metadata_matrix, q.unsqueeze(1)).squeeze(1)
         topk    = min(topk, scores.shape[0])
         top_idx = torch.topk(scores, k=topk).indices.tolist()
         return [self.track_ids_list[i] for i in top_idx]
 
-    def _retrieve_query_attributes(self, query_emb: torch.Tensor, topk: int) -> List[str]:
-        """Channel 4: query × attributes-qwen3 (128 dims)."""
-        scores  = torch.matmul(self.track_attributes_matrix, query_emb.unsqueeze(1)).squeeze(1)
-        topk    = min(topk, scores.shape[0])
-        top_idx = torch.topk(scores, k=topk).indices.tolist()
-        return [self.track_ids_list[i] for i in top_idx]
-
-    # ── BM25 helpers (Channel 5) ─────────────────────────────────────────────
+    # ── Channel 5: BM25 keyword search ───────────────────────────────────────
 
     def _stringify_metadata(self, track_id: str) -> str:
-        """Convert track metadata to BM25 text."""
+        """Convert track metadata to BM25 index text."""
         meta = self.track_metadata_dict.get(track_id, {})
         parts = []
         for field in ["track_name", "artist_name", "album_name", "tag_list", "release_date"]:
@@ -519,11 +411,11 @@ class MultiChannelRetrieval:
         return " ".join(parts)
 
     def _build_bm25_index(self, build: bool = True):
-        bm25_dir  = os.path.join("qwen", "retrieval_indices", "bm25_index")
-        ids_path  = os.path.join(bm25_dir, "track_ids.json")
+        bm25_dir = os.path.join("qwen", "retrieval_indices", "bm25_index")
+        ids_path = os.path.join(bm25_dir, "track_ids.json")
         if os.path.exists(ids_path):
             logger.info("Loading cached BM25 index …")
-            self._bm25_model = bm25s.BM25.load(bm25_dir, load_corpus=True)
+            self._bm25_model     = bm25s.BM25.load(bm25_dir, load_corpus=True)
             with open(ids_path) as f:
                 self._bm25_track_ids = json.load(f)
             logger.info("  BM25 index loaded (%d tracks).", len(self._bm25_track_ids))
@@ -547,79 +439,78 @@ class MultiChannelRetrieval:
         self._bm25_track_ids = track_ids
         logger.info("BM25 index built (%d tracks).", len(track_ids))
 
-    def _retrieve_bm25(self, query: str, topk: int) -> List[str]:
-        """Channel 5: BM25 text matching."""
-        tokens = bm25s.tokenize([query.lower()])
-        results = self._bm25_model.retrieve(tokens, k=min(topk, len(self._bm25_track_ids)),
-                                            return_as="tuple")
+    def _retrieve_bm25_single(self, query: str, topk: int) -> List[str]:
+        """BM25 retrieval for a single query string."""
+        if not query or not query.strip():
+            return []
+        tokens  = bm25s.tokenize([query.lower()])
+        results = self._bm25_model.retrieve(
+            tokens,
+            k=min(topk, len(self._bm25_track_ids)),
+            return_as="tuple",
+        )
         return [self._bm25_track_ids[item["id"]] for item in results.documents[0]]
 
-    # ── BERT helpers (Channel 6) ─────────────────────────────────────────────
+    def _retrieve_bm25(
+        self,
+        current_query: str,
+        topk: int,
+        session_id: Optional[str] = None,
+        turn_number: Optional[int] = None,
+    ) -> List[str]:
+        """Channel 5: keyword-based BM25.
 
-    def _build_bert_index(self, build: bool = True):
-        bert_dir    = os.path.join("qwen", "retrieval_indices", "qwen_semantic_index")
-        emb_path    = os.path.join(bert_dir, "embeddings.pt")
-        ids_path    = os.path.join(bert_dir, "track_ids.json")
-        if os.path.exists(emb_path) and os.path.exists(ids_path):
-            logger.info("Loading cached semantic index …")
-            self._bert_matrix    = torch.load(emb_path, map_location="cpu",
-                                               weights_only=True)
-            with open(ids_path) as f:
-                self._bert_track_ids = json.load(f)
-            logger.info("  Semantic index loaded (%d tracks).", len(self._bert_track_ids))
-            return
-        if not build:
-            raise FileNotFoundError(
-                "Semantic index not found and build=False (inference mode).\n"
-                f"  Expected: {emb_path}\n"
-                "  Run training first to build the index."
-            )
-        os.makedirs(bert_dir, exist_ok=True)
-        track_ids = list(self.track_metadata_dict.keys())
-        texts     = [self._stringify_metadata(tid) for tid in track_ids]
-        all_embs  = []
-        bs = 256  # Qwen3-0.6B; increase if OOM
-        self._bert_model.eval()
-        with torch.no_grad():
-            from tqdm import tqdm as _tqdm
-            for start in _tqdm(range(0, len(texts), bs),
-                               desc="Building semantic index", unit="batch"):
-                batch  = texts[start: start + bs]
-                inputs = self._bert_tokenizer(batch, padding=True, truncation=True,
-                                              max_length=128, return_tensors="pt")
-                inputs = {k: v.to(self._bert_device) for k, v in inputs.items()}
-                out    = self._bert_model(**inputs)
-                mask   = inputs["attention_mask"].unsqueeze(-1).float()
-                pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-                pooled = F.normalize(pooled, p=2, dim=1)
-                all_embs.append(pooled.cpu())
-        self._bert_matrix    = torch.cat(all_embs, dim=0)   # [N, 768]
-        self._bert_track_ids = track_ids
-        torch.save(self._bert_matrix, emb_path)
-        with open(ids_path, "w") as f:
-            json.dump(track_ids, f)
-        logger.info("BERT index built (%d tracks).", len(track_ids))
+        Strategy:
+        1. Try to get query-split keywords from the injected _query_split_store
+           (key: {session_id}_{turn_number}).
+        2. Extract non-empty fields from the parsed JSON.
+        3. Build one keyword string per non-empty field.
+        4. Divide `topk` evenly among the non-empty fields.
+        5. Merge results (preserve order, deduplicate).
+        6. Fall back to raw current_query if no query-split available.
+        """
+        keyword_strings: List[str] = []
 
-    def _encode_query_bert(self, query: str) -> torch.Tensor:
-        """Encode a single query with BERT → [768] normalised."""
-        self._bert_model.eval()
-        with torch.no_grad():
-            inputs = self._bert_tokenizer(query, return_tensors="pt", truncation=True,
-                                          max_length=128, padding=True)
-            inputs = {k: v.to(self._bert_device) for k, v in inputs.items()}
-            out    = self._bert_model(**inputs)
-            mask   = inputs["attention_mask"].unsqueeze(-1).float()
-            pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-            pooled = F.normalize(pooled, p=2, dim=1).squeeze(0)
-        return pooled.cpu()
+        if (self._query_split_store is not None
+                and session_id is not None
+                and turn_number is not None):
+            key = f"{session_id}_{turn_number}"
+            raw = self._query_split_store.get(key, None)
+            if raw:
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    for field in _QUERY_SPLIT_TEXT_FIELDS:
+                        val = parsed.get(field)
+                        if not val:
+                            continue
+                        if isinstance(val, list):
+                            kw = " ".join(str(v) for v in val if v)
+                        else:
+                            kw = str(val).strip()
+                        if kw:
+                            keyword_strings.append(kw)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
-    def _retrieve_bert(self, query: str, topk: int) -> List[str]:
-        """Channel 6: BERT cosine similarity."""
-        q_emb  = self._encode_query_bert(query)                      # [768]
-        scores = torch.matmul(self._bert_matrix, q_emb.unsqueeze(1)).squeeze(1)
-        topk   = min(topk, scores.shape[0])
-        top_idx = torch.topk(scores, k=topk).indices.tolist()
-        return [self._bert_track_ids[i] for i in top_idx]
+        if not keyword_strings:
+            # Fallback: use raw query
+            return self._retrieve_bm25_single(current_query, topk)
+
+        # Divide topk evenly; last sub-query gets the remainder
+        n = len(keyword_strings)
+        per_query = topk // n
+        remainder = topk - per_query * n
+
+        seen: Set[str] = set()
+        result: List[str] = []
+        for i, kw in enumerate(keyword_strings):
+            k_i = per_query + (remainder if i == n - 1 else 0)
+            for tid in self._retrieve_bm25_single(kw, k_i):
+                if tid not in seen:
+                    result.append(tid)
+                    seen.add(tid)
+
+        return result
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -631,53 +522,71 @@ class MultiChannelRetrieval:
         session_id: Optional[str] = None,
         turn_number: Optional[int] = None,
     ) -> List[str]:
-        """Multi-channel retrieval; returns deduplicated track list (~350).
+        """3-channel retrieval; returns deduplicated track list.
 
-        If session_id and turn_number are provided AND a turn store is loaded,
-        embeddings are looked up directly (no Qwen forward pass).
+        ch1: CF-BPR cosine similarity (100 candidates)
+        ch3: hist_conversation_embeddings × metadata-qwen3 (200 candidates)
+        ch5: BM25 keyword search from query_split (200 candidates)
+
+        Query embedding for ch3 priority order:
+          1. hist_conversation_embeddings (conv_emb_store, key={session_id}_{turn_number})
+          2. turn_store query embedding (1024d)
+          3. Qwen model fallback
         """
         if history_queries is None:
             history_queries = []
 
-        store = getattr(self, "_turn_store", None)
-        # Use turn store (1024-dim) if available; otherwise encode via Qwen (fallback)
-        # New key format: {session_id}_{turn}_query / {session_id}_{turn}_history
-        if store is not None and session_id is not None and turn_number is not None:
-            user_key = f"{session_id}_{turn_number}_query"
-            hist_key = f"{session_id}_{turn_number}_history"
-            current_emb = (
-                store[user_key].float()[:1024] if user_key in store
-                else self._encode_query(current_query)[:1024]
-            )
-            hist_emb_raw = (
-                store[hist_key].float()[:1024] if hist_key in store else None
-            )
-            current_emb = F.normalize(current_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
-            if hist_emb_raw is not None:
-                hist_emb = F.normalize(hist_emb_raw.unsqueeze(0), p=2, dim=1).squeeze(0)
-                query_emb = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
-            else:
-                query_emb = current_emb
-        else:
-            # Fallback: encode via Qwen, take first 1024 dims
-            current_emb = self._encode_query(current_query)[:1024]
-            if history_queries:
-                hist_embs = [self._encode_query(q)[:1024] for q in history_queries]
-                hist_emb  = torch.stack(hist_embs).mean(dim=0)
-                query_emb = F.normalize(0.3 * hist_emb + 0.7 * current_emb, p=2, dim=0)
-            else:
-                query_emb = current_emb
+        # ── Resolve 1024-dim query embedding for ch3 ────────────────────────
+        query_emb: Optional[torch.Tensor] = None
 
+        # 1. hist_conversation_embeddings store (preferred)
+        if (self._conv_emb_store is not None
+                and session_id is not None
+                and turn_number is not None):
+            key = f"{session_id}_{turn_number}"
+            if key in self._conv_emb_store:
+                raw = self._conv_emb_store[key].float()
+                if raw.shape[0] >= 1024:
+                    query_emb = raw[:1024]
+                else:
+                    query_emb = F.pad(raw, (0, 1024 - raw.shape[0]))
+
+        # 2. turn_store fallback
+        if query_emb is None:
+            store = getattr(self, "_turn_store", None)
+            if store is not None and session_id is not None and turn_number is not None:
+                q_key  = f"{session_id}_{turn_number}_query"
+                h_key  = f"{session_id}_{turn_number}_history"
+                if q_key in store:
+                    cur = store[q_key].float()[:1024]
+                    cur = F.normalize(cur.unsqueeze(0), p=2, dim=1).squeeze(0)
+                    if h_key in store:
+                        hist = store[h_key].float()[:1024]
+                        hist = F.normalize(hist.unsqueeze(0), p=2, dim=1).squeeze(0)
+                        query_emb = F.normalize(0.3 * hist + 0.7 * cur, p=2, dim=0)
+                    else:
+                        query_emb = cur
+
+        # 3. Qwen model fallback
+        if query_emb is None:
+            if current_query and current_query.strip():
+                query_emb = self._encode_query(current_query)
+            else:
+                query_emb = torch.zeros(1024)
+
+        # ── Run 3 channels ──────────────────────────────────────────────────
         ch1 = self._retrieve_cf_bpr(user_id, USER_MUSIC_TOWER_RECALL_NUM)
-        ch2 = self._retrieve_similar_users_music(user_id)
         ch3 = self._retrieve_query_metadata(query_emb, QUERY_METADATA_RECALL_NUM)
-        ch4 = self._retrieve_query_attributes(query_emb, QUERY_ATTRIBUTES_RECALL_NUM)
-        ch5 = self._retrieve_bm25(current_query, BM25_RECALL_NUM)
-        ch6 = self._retrieve_bert(current_query, BERT_RECALL_NUM)
+        ch5 = self._retrieve_bm25(
+            current_query,
+            BM25_RECALL_NUM,
+            session_id=session_id,
+            turn_number=turn_number,
+        )
 
         seen: Set[str] = set()
         result: List[str] = []
-        for tid in ch1 + ch2 + ch3 + ch4 + ch5 + ch6:
+        for tid in ch1 + ch3 + ch5:
             if tid not in seen:
                 result.append(tid)
                 seen.add(tid)
