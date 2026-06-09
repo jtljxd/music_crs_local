@@ -880,59 +880,111 @@ def collate_feat(samples: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
     return feats, labels
 
 
-def run_phase(phase_name: str,
-              samples: List[Dict],
-              bagging: BaggingReranker,
-              args,
-              epochs: int,
-              dataset_name: str,
-              test_conv_emb: Dict,
-              test_retrieval: Optional[Dict],
-              feat_store: FeatureStore,
-              ckpt_dir: str):
-    logger.info("[%s] %d samples, %d epochs, batch=%d",
-                phase_name, len(samples), epochs, args.batch_size)
+def _train_one_epoch(phase_name: str, epoch: int, total_epochs: int,
+                     samples: List[Dict], bagging: BaggingReranker, args):
+    """单 epoch 训练，每 1/10 epoch 向 logger 打一次各模型 loss。"""
+    random.shuffle(samples)
+    total_loss = {k: 0.0 for k in ["fm", "dcn", "xdfm", "ttg"]}
+    n_steps    = 0
+    n_batches  = max(1, len(samples) // args.batch_size)
+    log_every  = max(1, n_batches // 10)
 
-    # train LGBM once at the start of each phase on all samples
-    logger.info("[%s] Training LightGBM on %d samples...", phase_name, len(samples))
-    X = np.array([s["feat"].numpy() for s in samples])
-    y = np.array([int(s["label"]) for s in samples])
+    pbar = tqdm(range(0, len(samples), args.batch_size),
+                desc=f"[{phase_name}] Epoch {epoch}/{total_epochs}",
+                unit="batch", ncols=120)
+    for start in pbar:
+        batch = samples[start: start + args.batch_size]
+        if not batch: continue
+        feats, labels = collate_feat(batch)
+        losses = bagging.train_step(feats, labels)
+        for k in losses: total_loss[k] += losses[k]
+        n_steps += 1
+        pbar.set_postfix({k: f"{v/n_steps:.4f}" for k, v in total_loss.items()})
+        if n_steps % log_every == 0:
+            step_log = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in total_loss.items())
+            logger.info("[%s] Epoch %d  step %4d/%4d  loss: %s",
+                        phase_name, epoch, n_steps, n_batches, step_log)
+
+    avg_log = " | ".join(f"{k}={v/max(n_steps,1):.4f}" for k, v in total_loss.items())
+    logger.info("[%s] Epoch %d  DONE  loss: %s", phase_name, epoch, avg_log)
+
+
+def _fit_lgbm(phase_name: str, samples: List[Dict], bagging: BaggingReranker, args):
+    """在给定样本上训练 LightGBM（随机子采样上限）。"""
+    lgbm_max = getattr(args, "lgbm_max_samples", 80000)
+    sub = samples if len(samples) <= lgbm_max else random.sample(samples, lgbm_max)
+    logger.info("[LGBM-%s] Fitting on %d samples (max=%d)...",
+                phase_name, len(sub), lgbm_max)
+    X = np.array([s["feat"].numpy() for s in sub])
+    y = np.array([int(s["label"]) for s in sub])
     bagging.lgbm.fit(X, y)
+    logger.info("[LGBM-%s] Done.", phase_name)
 
-    for epoch in range(1, epochs + 1):
-        random.shuffle(samples)
-        total_loss = {k: 0.0 for k in ["fm", "dcn", "xdfm", "ttg"]}
-        n_steps = 0
 
-        n_batches = max(1, len(samples) // args.batch_size)
-        log_every  = max(1, n_batches // 5)  # 每 1/5 epoch 打印一次
-        pbar = tqdm(range(0, len(samples), args.batch_size),
-                    desc=f"[{phase_name}] Epoch {epoch}/{epochs}", unit="batch", ncols=120)
-        for start in pbar:
-            batch   = samples[start: start + args.batch_size]
-            if not batch: continue
-            feats, labels = collate_feat(batch)
-            losses = bagging.train_step(feats, labels)
-            for k in losses: total_loss[k] += losses[k]
-            n_steps += 1
-            pbar.set_postfix({k: f"{v/n_steps:.4f}" for k, v in total_loss.items()})
-            # nohup 日志里 tqdm 不可见，每 log_every 步额外打一行
-            if n_steps % log_every == 0:
-                step_log = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in total_loss.items())
-                logger.info("[%s] Epoch %d  step %d/%d  %s",
-                            phase_name, epoch, n_steps, n_batches, step_log)
+def run_training(dataset_name: str,
+                 train_samples: List[Dict],
+                 test_samples:  List[Dict],
+                 bagging: BaggingReranker,
+                 args,
+                 test_conv_emb: Dict,
+                 test_retrieval: Optional[Dict],
+                 feat_store: FeatureStore,
+                 ckpt_dir: str):
+    """
+    交替训练流程，共 args.train_epochs 轮：
 
-        avg_log = " | ".join(f"{k}={v/max(n_steps,1):.4f}" for k, v in total_loss.items())
-        logger.info("[%s] Epoch %d  DONE  %s", phase_name, epoch, avg_log)
+      for epoch in 1..train_epochs:
+        1. LGBM fit (train)
+        2. 神经网络 1 epoch (train，lr=args.lr)
+        3. 在 test 上评估 NDCG@20（各模型 + ensemble）
+        4. LGBM fit (test)
+        5. 神经网络 1 epoch (test，lr=args.lr_finetune)
+        6. 在 test 上再次评估 NDCG@20
+        7. 恢复 lr=args.lr，保存 checkpoint
+    """
+    total_epochs = args.train_epochs
 
-        # ── evaluate on test after each epoch ────────────────────────────
-        logger.info("[%s] Evaluating NDCG@20 on test...", phase_name)
-        result = evaluate_ndcg(bagging, dataset_name, "test",
-                               test_conv_emb, test_retrieval, feat_store,
-                               max_sessions=200, k=20)
-        print_ndcg_table(phase_name, epoch, result, k=20)
+    for epoch in range(1, total_epochs + 1):
+        logger.info("\n%s", "=" * 70)
+        logger.info("  EPOCH %d / %d", epoch, total_epochs)
+        logger.info("%s", "=" * 70)
 
-        bagging.save(os.path.join(ckpt_dir, f"{phase_name}_epoch{epoch}"))
+        # ── Step 1+2: LGBM + neural on train ─────────────────────────────
+        _fit_lgbm("train", train_samples, bagging, args)
+        _train_one_epoch("TRAIN", epoch, total_epochs, train_samples, bagging, args)
+
+        # ── Step 3: Evaluate on test ──────────────────────────────────────
+        logger.info("[Epoch %d] === Evaluating after TRAIN epoch ===", epoch)
+        result_after_train = evaluate_ndcg(
+            bagging, dataset_name, "test",
+            test_conv_emb, test_retrieval, feat_store,
+            max_sessions=400, k=20)
+        print_ndcg_table(f"After-Train-E{epoch}", epoch, result_after_train, k=20)
+
+        if test_samples:
+            # ── Step 4+5: LGBM + neural on test (fine-tune lr) ───────────
+            _fit_lgbm("test", test_samples, bagging, args)
+            for opt in [bagging.opt_fm, bagging.opt_dcn,
+                        bagging.opt_xdfm, bagging.opt_ttg]:
+                for pg in opt.param_groups: pg["lr"] = args.lr_finetune
+            _train_one_epoch("TEST-FT", epoch, total_epochs, test_samples, bagging, args)
+
+            # 恢复 lr
+            for opt in [bagging.opt_fm, bagging.opt_dcn,
+                        bagging.opt_xdfm, bagging.opt_ttg]:
+                for pg in opt.param_groups: pg["lr"] = args.lr
+
+            # ── Step 6: Evaluate again ────────────────────────────────────
+            logger.info("[Epoch %d] === Evaluating after TEST-FT epoch ===", epoch)
+            result_after_test = evaluate_ndcg(
+                bagging, dataset_name, "test",
+                test_conv_emb, test_retrieval, feat_store,
+                max_sessions=400, k=20)
+            print_ndcg_table(f"After-TestFT-E{epoch}", epoch, result_after_test, k=20)
+
+        # ── Step 7: Checkpoint ────────────────────────────────────────────
+        bagging.save(os.path.join(ckpt_dir, f"epoch{epoch}"))
+        logger.info("[Epoch %d] Checkpoint saved to %s/epoch%d", epoch, ckpt_dir, epoch)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,18 +1036,9 @@ def main(args):
     ckpt_dir = args.checkpoint_dir
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # ── Phase 1: train split ──────────────────────────────────────────────
-    run_phase("train", train_samples, bagging, args, args.train_epochs,
-              dataset_name, test_ce, test_retr, feat_store, ckpt_dir)
-
-    # ── Phase 2: test fine-tune ───────────────────────────────────────────
-    if test_samples and args.test_epochs > 0:
-        logger.info("Phase 2: fine-tune on test split (lr=%.2e)", args.lr_finetune)
-        for opt in [bagging.opt_fm, bagging.opt_dcn, bagging.opt_xdfm, bagging.opt_ttg]:
-            for pg in opt.param_groups:
-                pg["lr"] = args.lr_finetune
-        run_phase("test_ft", test_samples, bagging, args, args.test_epochs,
-                  dataset_name, test_ce, test_retr, feat_store, ckpt_dir)
+    # ── Phase 1 & 2: 交替训练（train epoch → eval → test epoch → eval）────
+    run_training(dataset_name, train_samples, test_samples,
+                 bagging, args, test_ce, test_retr, feat_store, ckpt_dir)
 
     # ── Save final ────────────────────────────────────────────────────────
     final_dir = os.path.join("qwen", "bagging_reranker")
@@ -1016,10 +1059,13 @@ def parse_args():
                    help="Pre-saved retrieval candidates dict {emb_key: [track_id, ...]}")
     p.add_argument("--retrieval_test",   type=str, default="qwen/retrieval_test_candidates.pt")
     p.add_argument("--train_epochs",     type=int,   default=5)
-    p.add_argument("--test_epochs",      type=int,   default=5)
+    p.add_argument("--test_epochs",      type=int,   default=5,
+                   help="Kept for compatibility; test fine-tune is now 1 pass per train epoch")
     p.add_argument("--batch_size",       type=int,   default=64)
     p.add_argument("--lr",               type=float, default=1e-3)
     p.add_argument("--lr_finetune",      type=float, default=3e-4)
+    p.add_argument("--lgbm_max_samples", type=int,   default=80000,
+                   help="Max samples for LightGBM training per phase (default 80000)")
     p.add_argument("--checkpoint_dir",   type=str,   default="qwen/bagging_ckpt")
     p.add_argument("--device",           type=str,   default=None)
     return p.parse_args()
