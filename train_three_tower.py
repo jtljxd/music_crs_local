@@ -598,9 +598,15 @@ def collate_batch(
 
 def run_phase(phase_name, samples, model, optimizer,
               track_data, user_data, all_tids, args, epochs, device, ckpt_dir):
-    loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-    logger.info("[%s] %d samples, %d epochs, batch=%d",
-                phase_name, len(samples), epochs, args.batch_size)
+    loss_fn    = nn.BCEWithLogitsLoss(reduction="none")
+    patience   = args.early_stop_patience
+    min_delta  = args.early_stop_min_delta
+    best_loss  = float("inf")
+    no_improve = 0
+    best_ckpt  = os.path.join(ckpt_dir, f"model_{phase_name}_best.pt")
+
+    logger.info("[%s] %d samples, max_epochs=%d, batch=%d, patience=%d",
+                phase_name, len(samples), epochs, args.batch_size, patience)
     global_step = 0
     for epoch in range(1, epochs + 1):
         random.shuffle(samples)
@@ -624,10 +630,33 @@ def run_phase(phase_name, samples, model, optimizer,
             if global_step % args.save_every == 0:
                 torch.save({"model_state_dict": model.state_dict()},
                            os.path.join(ckpt_dir, "model_latest.pt"))
-        logger.info("[%s] Epoch %d avg_loss=%.4f", phase_name, epoch,
-                    ep_loss / max(ep_steps, 1))
+        avg = ep_loss / max(ep_steps, 1)
+        logger.info("[%s] Epoch %d avg_loss=%.4f", phase_name, epoch, avg)
         torch.save({"model_state_dict": model.state_dict()},
                    os.path.join(ckpt_dir, f"model_{phase_name}_epoch{epoch}.pt"))
+
+        # ── Early stopping ──
+        if avg < best_loss - min_delta:
+            best_loss  = avg
+            no_improve = 0
+            torch.save({"model_state_dict": model.state_dict()}, best_ckpt)
+            logger.info("[%s] ★ New best loss=%.4f, saved to %s",
+                        phase_name, best_loss, best_ckpt)
+        else:
+            no_improve += 1
+            logger.info("[%s] No improvement %d/%d (best=%.4f)",
+                        phase_name, no_improve, patience, best_loss)
+            if no_improve >= patience:
+                logger.info("[%s] Early stopping at epoch %d.", phase_name, epoch)
+                break
+
+    # 训练结束后恢复最优权重
+    if os.path.exists(best_ckpt):
+        logger.info("[%s] Restoring best model from %s", phase_name, best_ckpt)
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+    return best_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -745,8 +774,12 @@ def parse_args():
     p.add_argument("--lr",              type=float, default=1e-3)
     p.add_argument("--lr_finetune",     type=float, default=3e-4)
     p.add_argument("--checkpoint_dir",  type=str,  default="qwen/cf_bpr_retrieval_ckpt")
-    p.add_argument("--save_every",      type=int,  default=500)
-    p.add_argument("--device",          type=str,  default=None)
+    p.add_argument("--save_every",           type=int,  default=500)
+    p.add_argument("--early_stop_patience",  type=int,  default=5,
+                   help="连续 N 个 epoch loss 无改善则提前停止")
+    p.add_argument("--early_stop_min_delta", type=float, default=1e-4,
+                   help="认为改善的最小 loss 下降量")
+    p.add_argument("--device",              type=str,  default=None)
     return p.parse_args()
 
 
