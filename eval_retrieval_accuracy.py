@@ -60,7 +60,7 @@ CHANNEL_NAMES = ["ch1_CF-BPR", "ch3_QwenMeta", "ch5_BM25", "ALL (union)"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Inline model — mirrors train_three_tower.py v5
+#  Inline models — mirrors train_three_tower.py v5 & train_qwen_meta_tower.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 import torch.nn as nn
@@ -173,6 +173,33 @@ class CFBPRThreeTower(nn.Module):
             self.item_tower(cf_bpr, attr_emb, meta_emb, pop_idx, year_idx, dur_idx),
             p=2, dim=1,
         )
+
+
+# ── QwenMeta Two-Tower (mirrors train_qwen_meta_tower.py) ───────────────────
+
+class _TowerMLP(nn.Module):
+    def __init__(self, in_dim, h1=512, h2=256, out=128, dropout=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, h1), nn.BatchNorm1d(h1), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(h1, h2),    nn.BatchNorm1d(h2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(h2, out),
+        )
+    def forward(self, x): return self.net(x)
+
+
+class QwenMetaTwoTower(nn.Module):
+    def __init__(self, conv_dim=1024, meta_dim=1024, temperature=20.0, dropout=0.2):
+        super().__init__()
+        self.temperature = temperature
+        self.query_tower = _TowerMLP(conv_dim, dropout=dropout)
+        self.item_tower  = _TowerMLP(meta_dim, dropout=dropout)
+
+    def encode_query(self, x):
+        return F.normalize(self.query_tower(x), p=2, dim=1)
+
+    def encode_item(self, x):
+        return F.normalize(self.item_tower(x), p=2, dim=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,14 +361,20 @@ def retrieve_ch1_cf_bpr(
 
 
 def retrieve_ch3_metadata(
-    query_emb:       torch.Tensor,  # [1024]
-    metadata_matrix: torch.Tensor,  # [N, 1024] normalised
+    ch3_model:       Optional["QwenMetaTwoTower"],
+    conv_emb:        torch.Tensor,   # [1024]
+    item_matrix:     torch.Tensor,   # [N, 128] (learned) or [N, 1024] (raw)
     track_ids:       List[str],
     topk:            int,
 ) -> List[str]:
-    """ch3: 1024-dim conv emb × metadata-qwen3."""
-    q = F.normalize(query_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
-    scores  = (metadata_matrix * q.unsqueeze(0)).sum(dim=1)
+    """ch3: QwenMeta双塔模型 query_vec × item_vec cosine（若无模型则 raw 余弦）."""
+    if ch3_model is not None:
+        ch3_model.eval()
+        with torch.no_grad():
+            q = ch3_model.encode_query(conv_emb.unsqueeze(0)).squeeze(0)  # [128]
+    else:
+        q = F.normalize(conv_emb.unsqueeze(0), p=2, dim=1).squeeze(0)
+    scores  = (item_matrix * q.unsqueeze(0)).sum(dim=1)
     topk    = min(topk, scores.shape[0])
     top_idx = torch.topk(scores, k=topk).indices.tolist()
     return [track_ids[i] for i in top_idx]
@@ -454,6 +487,44 @@ def evaluate(args):
     with open(track_ids_path) as f:
         meta_track_ids = json.load(f)
     logger.info("  metadata matrix: %s", list(metadata_matrix.shape))
+
+    # ── QwenMeta双塔 ch3 item index ────────────────────────────────────────────
+    ch3_model: Optional[QwenMetaTwoTower] = None
+    ch3_item_matrix: Optional[torch.Tensor] = None
+    ch3_item_ids: Optional[List[str]] = None
+
+    if args.ch3_model_path and os.path.exists(args.ch3_model_path):
+        logger.info("Loading QwenMeta two-tower model from %s …", args.ch3_model_path)
+        ch3_model = QwenMetaTwoTower()
+        ckpt = torch.load(args.ch3_model_path, map_location="cpu", weights_only=True)
+        ch3_model.load_state_dict(ckpt["model_state_dict"])
+        ch3_model.eval()
+        # 检查是否有预建 item index
+        ch3_idx_dir   = os.path.join("qwen", "qwen_meta_tower", "item_index")
+        ch3_vec_path  = os.path.join(ch3_idx_dir, "item_vectors.pt")
+        ch3_ids_path  = os.path.join(ch3_idx_dir, "track_ids.json")
+        if os.path.exists(ch3_vec_path) and os.path.exists(ch3_ids_path):
+            ch3_item_matrix = torch.load(ch3_vec_path, map_location="cpu", weights_only=True)
+            with open(ch3_ids_path) as f:
+                ch3_item_ids = json.load(f)
+            logger.info("  ch3 item index loaded: %d tracks", len(ch3_item_ids))
+        else:
+            logger.info("  Building ch3 item index on-the-fly …")
+            all_tids = sorted(track_data.keys())
+            vecs = []
+            bs = 512
+            with torch.no_grad():
+                for start in tqdm(range(0, len(all_tids), bs), desc="ch3 item index"):
+                    b_ids = all_tids[start: start + bs]
+                    b_emb = torch.stack([track_data[b]["meta_emb"] for b in b_ids])
+                    vecs.append(ch3_model.encode_item(b_emb).cpu())
+            ch3_item_matrix = torch.cat(vecs, dim=0)
+            ch3_item_ids    = all_tids
+            logger.info("  ch3 item index built: %d tracks", len(ch3_item_ids))
+    else:
+        logger.info("No ch3 model found; ch3 uses raw metadata-qwen3 cosine.")
+        ch3_item_ids   = meta_track_ids
+        ch3_item_matrix = metadata_matrix
 
     # CF-BPR item index (from trained three-tower) – optional
     cf_model: Optional[CFBPRThreeTower] = None
@@ -594,7 +665,7 @@ def evaluate(args):
                 track_data, cf_item_matrix, cf_item_ids, max_k,
             )
             ch3_all = retrieve_ch3_metadata(
-                conv_emb, metadata_matrix, meta_track_ids, max_k
+                ch3_model, conv_emb, ch3_item_matrix, ch3_item_ids, max_k
             )
             ch5_all = retrieve_ch5_bm25(
                 bm25_model, bm25_track_ids, user_query, query_split_dict, max_k
@@ -668,6 +739,9 @@ def parse_args():
     p.add_argument("--cf_model_path",     type=str,
                    default="qwen/cf_bpr_retrieval/model.pt",
                    help="Trained three-tower model checkpoint (.pt)")
+    p.add_argument("--ch3_model_path",    type=str,
+                   default="qwen/qwen_meta_tower/model.pt",
+                   help="Trained QwenMeta two-tower model checkpoint (.pt)")
     p.add_argument("--max_sessions",      type=int, default=200,
                    help="Number of sessions to evaluate")
     p.add_argument("--split",             type=str, default="test",
