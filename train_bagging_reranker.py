@@ -453,13 +453,25 @@ class LGBMWrapper:
     """LightGBM ranker wrapper with sklearn-like API."""
 
     def __init__(self):
-        import lightgbm as lgb
-        self.lgb   = lgb
+        self.lgb   = None  # lazy import in fit()
         self.model = None
         self.fitted = False
+        # 检查是否可用
+        try:
+            import lightgbm as _lgb  # noqa
+            self._available = True
+        except ImportError:
+            self._available = False
+            logger.warning("lightgbm not installed. LGBMWrapper will be skipped. "
+                           "Install with: pip install lightgbm")
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         """Train on (N, D) features and binary labels (1=positive)."""
+        if not self._available:
+            logger.warning("[LGBM] Skipping fit — lightgbm not installed.")
+            return
+        import lightgbm as lgb
+        self.lgb = lgb
         self.model = self.lgb.LGBMClassifier(
             n_estimators=200,
             max_depth=6,
@@ -892,8 +904,10 @@ def run_phase(phase_name: str,
         total_loss = {k: 0.0 for k in ["fm", "dcn", "xdfm", "ttg"]}
         n_steps = 0
 
+        n_batches = max(1, len(samples) // args.batch_size)
+        log_every  = max(1, n_batches // 5)  # 每 1/5 epoch 打印一次
         pbar = tqdm(range(0, len(samples), args.batch_size),
-                    desc=f"[{phase_name}] Epoch {epoch}/{epochs}", unit="batch")
+                    desc=f"[{phase_name}] Epoch {epoch}/{epochs}", unit="batch", ncols=120)
         for start in pbar:
             batch   = samples[start: start + args.batch_size]
             if not batch: continue
@@ -902,9 +916,14 @@ def run_phase(phase_name: str,
             for k in losses: total_loss[k] += losses[k]
             n_steps += 1
             pbar.set_postfix({k: f"{v/n_steps:.4f}" for k, v in total_loss.items()})
+            # nohup 日志里 tqdm 不可见，每 log_every 步额外打一行
+            if n_steps % log_every == 0:
+                step_log = " | ".join(f"{k}={v/n_steps:.4f}" for k, v in total_loss.items())
+                logger.info("[%s] Epoch %d  step %d/%d  %s",
+                            phase_name, epoch, n_steps, n_batches, step_log)
 
         avg_log = " | ".join(f"{k}={v/max(n_steps,1):.4f}" for k, v in total_loss.items())
-        logger.info("[%s] Epoch %d  %s", phase_name, epoch, avg_log)
+        logger.info("[%s] Epoch %d  DONE  %s", phase_name, epoch, avg_log)
 
         # ── evaluate on test after each epoch ────────────────────────────
         logger.info("[%s] Evaluating NDCG@20 on test...", phase_name)
