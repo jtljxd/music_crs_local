@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOPK_LIST    = [20, 50, 100, 200]
+TOPK_LIST    = [20, 50, 100, 200, 300, 400, 500]
 CONV_EMB_DIM = 1024
 CF_BPR_DIM   = 128
 OUTPUT_DIM   = 128
