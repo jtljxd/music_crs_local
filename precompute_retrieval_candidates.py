@@ -104,10 +104,10 @@ class ItemTower(nn.Module):
         self.meta_proj=nn.Linear(1024,META_PROJ_DIM)
         self.pop_emb=nn.Embedding(8,POP_BUCKET_DIM)
         self.year_emb=nn.Embedding(8,RELEASE_YEAR_BUCKET_DIM)
-        self.dur_emb=nn.Embedding(8,DURATION_BUCKET_DIM)
+        self.duration_emb=nn.Embedding(8,DURATION_BUCKET_DIM)
         self.net=nn.Sequential(nn.Linear(ITEM_INPUT_DIM,256),nn.BatchNorm1d(256),nn.ReLU(),nn.Dropout(0.2),nn.Linear(256,OUTPUT_DIM))
     def forward(self,cf,attr,meta,pop,year,dur):
-        return self.net(torch.cat([cf,self.attr_proj(attr),self.meta_proj(meta),self.pop_emb(pop),self.year_emb(year),self.dur_emb(dur)],1))
+        return self.net(torch.cat([cf,self.attr_proj(attr),self.meta_proj(meta),self.pop_emb(pop),self.year_emb(year),self.duration_emb(dur)],1))
 
 class CFBPRThreeTower(nn.Module):
     def __init__(self):
