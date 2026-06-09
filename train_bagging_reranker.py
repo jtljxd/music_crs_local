@@ -426,7 +426,7 @@ class xDeepFMModel(nn.Module):
             nn.Linear(hidden, hidden // 2), nn.BatchNorm1d(hidden // 2), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden // 2, 64),
         )
-        cin_out_dim = cin_units * emb_dim * 2  # 2 CIN layers sum-pooled
+        cin_out_dim = cin_units * 2  # 2 CIN layers, each sum-pooled over emb_dim → [B, cin_units]
         self.out = nn.Linear(64 + cin_out_dim + 1, 1)
         self.linear = nn.Linear(input_dim, 1, bias=True)
 
