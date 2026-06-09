@@ -485,7 +485,7 @@ class LGBMWrapper:
             n_jobs=8,
             verbose=-1,
         )
-        self.model.fit(X, y)
+        self.model.fit(np.asarray(X), np.asarray(y))  # 强制 numpy array，避免 feature name warning
         self.fitted = True
 
     def predict_score(self, X: np.ndarray) -> np.ndarray:
@@ -568,10 +568,10 @@ class BaggingReranker:
         self.lgbm    = LGBMWrapper()
 
         # ── optimizers ───────────────────────────────────────────────────
-        self.opt_fm   = torch.optim.Adam(self.fm.parameters(),   lr=args.lr, weight_decay=1e-4)
-        self.opt_dcn  = torch.optim.Adam(self.dcn.parameters(),  lr=args.lr, weight_decay=1e-4)
-        self.opt_xdfm = torch.optim.Adam(self.xdfm.parameters(), lr=args.lr, weight_decay=1e-4)
-        self.opt_ttg  = torch.optim.Adam(self.ttg.parameters(),  lr=args.lr, weight_decay=1e-4)
+        self.opt_fm   = torch.optim.Adam(self.fm.parameters(),   lr=args.lr,        weight_decay=1e-4)
+        self.opt_dcn  = torch.optim.Adam(self.dcn.parameters(),   lr=args.lr * 0.1,  weight_decay=1e-4)  # 更小 lr 防梯度爆炸
+        self.opt_xdfm = torch.optim.Adam(self.xdfm.parameters(), lr=args.lr * 0.1,  weight_decay=1e-4)  # 同上
+        self.opt_ttg  = torch.optim.Adam(self.ttg.parameters(),   lr=args.lr,        weight_decay=1e-4)
 
         self.loss_fn = nn.BCEWithLogitsLoss()
 
@@ -600,12 +600,7 @@ class BaggingReranker:
         return s_fm, s_dcn, s_xdfm, s_ttg
 
     def train_step(self, feat: torch.Tensor, label: torch.Tensor):
-        """Single gradient step on all neural models."""
-        for model, opt in [(self.fm, self.opt_fm),
-                           (self.dcn, self.opt_dcn),
-                           (self.xdfm, self.opt_xdfm),
-                           (self.ttg, self.opt_ttg)]:
-            model.train()
+        """Single gradient step on all neural models, with gradient clipping."""
         self.fm.train(); self.dcn.train(); self.xdfm.train(); self.ttg.train()
 
         feat   = feat.to(self.device)
@@ -618,15 +613,25 @@ class BaggingReranker:
             ("xdfm", self.xdfm, self.opt_xdfm),
         ]:
             score = model(feat)
+            # 防止 logit 过大导致 loss 爆炸
+            score = torch.clamp(score, -20.0, 20.0)
             loss  = self.loss_fn(score, label)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            # 梯度裁剪：防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
             losses[name] = loss.item()
 
         # three-tower gate
         uf, qf, itf, sf = self._split_feat(feat)
         s_ttg = self.ttg(uf, qf, itf, sf)
+        s_ttg = torch.clamp(s_ttg, -20.0, 20.0)
         loss_ttg = self.loss_fn(s_ttg, label)
-        self.opt_ttg.zero_grad(); loss_ttg.backward(); self.opt_ttg.step()
+        self.opt_ttg.zero_grad()
+        loss_ttg.backward()
+        torch.nn.utils.clip_grad_norm_(self.ttg.parameters(), max_norm=1.0)
+        self.opt_ttg.step()
         losses["ttg"] = loss_ttg.item()
 
         return losses
@@ -766,31 +771,50 @@ def build_samples(dataset_name: str, split: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  NDCG@K evaluation
+#  Hit@K evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ndcg_at_k(ranked_labels: List[int], k: int = 20) -> float:
-    """Compute NDCG@K given a list of relevance labels (1 or 0), sorted by model."""
-    dcg = sum(rel / math.log2(i + 2) for i, rel in enumerate(ranked_labels[:k]))
-    ideal = sorted(ranked_labels, reverse=True)
-    idcg  = sum(rel / math.log2(i + 2) for i, rel in enumerate(ideal[:k]))
-    return dcg / idcg if idcg > 0 else 0.0
 
 
-def evaluate_ndcg(bagging: BaggingReranker,
-                  dataset_name: str,
-                  split: str,
-                  conv_emb_store: Dict,
-                  retrieval_store: Optional[Dict],
-                  feat_store: FeatureStore,
-                  max_sessions: int = 200,
-                  k: int = 20) -> Dict[str, float]:
-    """Evaluate NDCG@K per model + ensemble on `max_sessions` sessions."""
+# ─────────────────────────────────────────────────────────────────────────────
+#  Evaluation: Hit@K + NDCG@K (single-positive per query)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ndcg_at_k_single(rank: int, k: int) -> float:
+    """
+    单正例 NDCG@K。
+    rank: gt 在排序结果中的位置（0-indexed）。
+    若 rank >= k，则 NDCG@K = 0；否则 1 / log2(rank + 2)。
+    IDCG@K = 1.0（理想情况 gt 排第1，1/log2(2)=1）。
+    """
+    if rank >= k:
+        return 0.0
+    return 1.0 / math.log2(rank + 2)
+
+
+def evaluate_ranking(bagging: "BaggingReranker",
+                     dataset_name: str,
+                     split: str,
+                     conv_emb_store: Dict,
+                     retrieval_store: Optional[Dict],
+                     feat_store: "FeatureStore",
+                     max_sessions: int = 400,
+                     k: int = 20) -> Dict[str, dict]:
+    """
+    统计各排序模型的 Hit@K 和 NDCG@K。
+    直接用真实召回池，不强制插入 gt。
+    gt 不在召回池时：Hit=0, NDCG=0（真实代价）。
+
+    返回:
+      {model_name: {"hit": int, "ndcg_sum": float, "total": int,
+                    "hit_rate": float, "ndcg": float}}
+    """
     ds = load_dataset(dataset_name, split=split)
     model_names = ["FM", "DCN", "xDeepFM", "LGBM", "TTGate", "Ensemble"]
-    ndcg_sums   = {m: 0.0 for m in model_names}
-    n_queries   = 0
-    n_sessions  = 0
+    hit_counts = {m: 0   for m in model_names}
+    ndcg_sums  = {m: 0.0 for m in model_names}
+    n_queries  = 0
+    n_sessions = 0
 
     for item in ds:
         if n_sessions >= max_sessions: break
@@ -798,10 +822,8 @@ def evaluate_ndcg(bagging: BaggingReranker,
         session_id = item["session_id"]
         user_id    = item.get("user_id")
         convs      = item["conversations"]
-        assessments= item.get("goal_progress_assessments", [])
         asmt_map   = {int(a["turn_number"]): a.get("goal_progress_assessment")
-                      for a in assessments}
-
+                      for a in item.get("goal_progress_assessments", [])}
         music_turns = {int(c["turn_number"]): c["content"]
                        for c in convs
                        if c.get("role") == "music" and c.get("content")}
@@ -809,8 +831,7 @@ def evaluate_ndcg(bagging: BaggingReranker,
         for turn_num, gt_tid in music_turns.items():
             fb_turn = turn_num + 1
             if fb_turn not in asmt_map: continue
-            gpa = asmt_map[fb_turn]
-            if gpa not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"): continue
+            if asmt_map[fb_turn] not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"): continue
 
             emb_key = f"{session_id}_{turn_num}"
             if emb_key not in conv_emb_store:
@@ -822,51 +843,70 @@ def evaluate_ndcg(bagging: BaggingReranker,
             elif conv_emb.shape[0] < CONV_EMB_DIM:
                 conv_emb = F.pad(conv_emb, (0, CONV_EMB_DIM - conv_emb.shape[0]))
 
-            # build candidate list: gt + retrieval pool
-            pool_key = emb_key
+            # 直接用真实召回池
             cands: List[str] = []
             if retrieval_store:
-                c = retrieval_store.get(pool_key) or retrieval_store.get(f"{session_id}_{turn_num}")
-                if c: cands = list(c)
-            if gt_tid not in cands:
-                cands = [gt_tid] + cands[:k - 1]
-            if len(cands) < k:
-                extra = [t for t in feat_store.all_track_ids if t not in set(cands)]
-                cands += random.sample(extra, min(k - len(cands), len(extra)))
+                raw = (retrieval_store.get(emb_key)
+                       or retrieval_store.get(f"{session_id}_{turn_num}"))
+                if isinstance(raw, dict):
+                    cands = list(raw.get("union", []))
+                elif isinstance(raw, list):
+                    cands = list(raw)
+            if not cands:
+                continue
 
+            n_queries += 1
             feats = torch.stack([
                 feat_store.build_feature(user_id, tid, conv_emb, r, len(cands))
                 for r, tid in enumerate(cands)
             ])
             scores = bagging.predict_scores(feats)
-            labels = [1 if tid == gt_tid else 0 for tid in cands]
+
+            def _score_query(scr):
+                ranked = torch.argsort(scr, descending=True).tolist()
+                rank = next((i for i, idx in enumerate(ranked) if cands[idx] == gt_tid), len(cands))
+                return rank
 
             for mname, scr in scores.items():
-                ranked_idx   = torch.argsort(scr, descending=True).tolist()
-                ranked_labels = [labels[i] for i in ranked_idx]
-                ndcg_sums[mname] += ndcg_at_k(ranked_labels, k)
+                rank = _score_query(scr)
+                if rank < k:
+                    hit_counts[mname] += 1
+                ndcg_sums[mname] += _ndcg_at_k_single(rank, k)
 
-            # ensemble: equal weight avg
+            # ensemble
             ens_score = sum(scores[m] for m in ["FM", "DCN", "xDeepFM", "LGBM", "TTGate"]) * ENSEMBLE_W
-            ranked_idx     = torch.argsort(ens_score, descending=True).tolist()
-            ranked_labels  = [labels[i] for i in ranked_idx]
-            ndcg_sums["Ensemble"] += ndcg_at_k(ranked_labels, k)
+            rank_ens = _score_query(ens_score)
+            if rank_ens < k:
+                hit_counts["Ensemble"] += 1
+            ndcg_sums["Ensemble"] += _ndcg_at_k_single(rank_ens, k)
 
-            n_queries += 1
-
-    result = {m: ndcg_sums[m] / max(n_queries, 1) for m in model_names}
+    result = {
+        m: {
+            "hit":      hit_counts[m],
+            "ndcg_sum": ndcg_sums[m],
+            "total":    n_queries,
+            "hit_rate": hit_counts[m] / max(n_queries, 1),
+            "ndcg":     ndcg_sums[m]  / max(n_queries, 1),
+        }
+        for m in model_names
+    }
     return result
 
 
-def print_ndcg_table(phase: str, epoch: int, result: Dict[str, float], k: int = 20):
+def print_ranking_table(phase: str, epoch: int, result: Dict[str, dict], k: int = 20):
     lines = [
-        f"\n{'='*60}",
-        f"  NDCG@{k} | {phase}  Epoch {epoch}",
-        f"{'='*60}",
+        f"\n{'='*72}",
+        f"  Hit@{k} & NDCG@{k} | {phase}  Epoch {epoch}",
+        f"{'='*72}",
+        f"  {'Model':<12}  {'Hit':>6}/{'Total':<6}  {'Hit@K':>7}  {'NDCG@K':>8}",
+        f"  {'-'*56}",
     ]
     for m, v in result.items():
-        lines.append(f"  {m:<12}  {v*100:.3f}%")
-    lines.append("=" * 60)
+        lines.append(
+            f"  {m:<12}  {v['hit']:>6}/{v['total']:<6}  "
+            f"{v['hit_rate']*100:>6.2f}%  {v['ndcg']*100:>7.3f}%"
+        )
+    lines.append("=" * 72)
     logger.info("\n".join(lines))
 
 
@@ -955,11 +995,11 @@ def run_training(dataset_name: str,
 
         # ── Step 3: Evaluate on test ──────────────────────────────────────
         logger.info("[Epoch %d] === Evaluating after TRAIN epoch ===", epoch)
-        result_after_train = evaluate_ndcg(
+        result_after_train = evaluate_ranking(
             bagging, dataset_name, "test",
             test_conv_emb, test_retrieval, feat_store,
             max_sessions=400, k=20)
-        print_ndcg_table(f"After-Train-E{epoch}", epoch, result_after_train, k=20)
+        print_ranking_table(f"After-Train-E{epoch}", epoch, result_after_train, k=20)
 
         if test_samples:
             # ── Step 4+5: LGBM + neural on test (fine-tune lr) ───────────
@@ -976,11 +1016,11 @@ def run_training(dataset_name: str,
 
             # ── Step 6: Evaluate again ────────────────────────────────────
             logger.info("[Epoch %d] === Evaluating after TEST-FT epoch ===", epoch)
-            result_after_test = evaluate_ndcg(
+            result_after_test = evaluate_ranking(
                 bagging, dataset_name, "test",
                 test_conv_emb, test_retrieval, feat_store,
                 max_sessions=400, k=20)
-            print_ndcg_table(f"After-TestFT-E{epoch}", epoch, result_after_test, k=20)
+            print_ranking_table(f"After-TestFT-E{epoch}", epoch, result_after_test, k=20)
 
         # ── Step 7: Checkpoint ────────────────────────────────────────────
         bagging.save(os.path.join(ckpt_dir, f"epoch{epoch}"))
