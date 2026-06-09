@@ -81,6 +81,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 专用 eval logger：评估结果同时写入独立的 eval_results.txt
+_eval_logger = logging.getLogger("eval")
+_eval_logger.setLevel(logging.INFO)
+_eval_logger.propagate = False  # 不混入主 logger
+_eval_fh = logging.FileHandler("eval_results.txt", mode="a", encoding="utf-8")
+_eval_fh.setFormatter(logging.Formatter("%(message)s"))
+_eval_logger.addHandler(_eval_fh)
+
 # ── constants ────────────────────────────────────────────────────────────────
 CONV_EMB_DIM   = 1024
 CF_BPR_DIM     = 128
@@ -337,20 +345,38 @@ class FeatureStore:
 # ── 1. FM ────────────────────────────────────────────────────────────────────
 
 class FMModel(nn.Module):
-    """Factorization Machine: bias + linear + 2nd-order interaction."""
+    """
+    DeepFM-style FM：先用 MLP 将 dense 输入压缩到低维空间，
+    再对压缩后的特征做 FM 二阶交叉 + 线性项。
+    这样避免直接对 6739d dense 向量做平方累加导致数值爆炸。
+    """
 
-    def __init__(self, input_dim: int, k: int = 16):
+    def __init__(self, input_dim: int, proj_dim: int = 256, k: int = 16,
+                 dropout: float = 0.2):
         super().__init__()
+        # 压缩层：6739d → 1024 → proj_dim
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(1024, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        # FM 部分（作用在压缩后的 proj_dim 维）
         self.bias      = nn.Parameter(torch.zeros(1))
-        self.linear    = nn.Linear(input_dim, 1, bias=False)
-        self.embedding = nn.Parameter(torch.empty(input_dim, k))
+        self.linear    = nn.Linear(proj_dim, 1, bias=False)
+        self.embedding = nn.Parameter(torch.empty(proj_dim, k))
         nn.init.normal_(self.embedding, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, D] → [B]
-        lin  = self.linear(x).squeeze(-1)
-        xv   = x @ self.embedding                          # [B, k]
-        sq_sum   = xv.pow(2).sum(1)
-        sum_sq   = (x.pow(2) @ self.embedding.pow(2)).sum(1)
+        h = self.proj(x)                                   # [B, proj_dim]
+        lin = self.linear(h).squeeze(-1)                   # [B]
+        xv      = h @ self.embedding                       # [B, k]
+        sq_sum  = xv.pow(2).sum(1)                         # [B]
+        sum_sq  = (h.pow(2) @ self.embedding.pow(2)).sum(1)# [B]
         return self.bias + lin + 0.5 * (sq_sum - sum_sq)
 
 
@@ -568,7 +594,7 @@ class BaggingReranker:
         self.lgbm    = LGBMWrapper()
 
         # ── optimizers ───────────────────────────────────────────────────
-        self.opt_fm   = torch.optim.Adam(self.fm.parameters(),   lr=args.lr,        weight_decay=1e-4)
+        self.opt_fm   = torch.optim.Adam(self.fm.parameters(),   lr=args.lr * 0.1,  weight_decay=1e-4)  # BN 加了之后 lr 同样收敛
         self.opt_dcn  = torch.optim.Adam(self.dcn.parameters(),   lr=args.lr * 0.1,  weight_decay=1e-4)  # 更小 lr 防梯度爆炸
         self.opt_xdfm = torch.optim.Adam(self.xdfm.parameters(), lr=args.lr * 0.1,  weight_decay=1e-4)  # 同上
         self.opt_ttg  = torch.optim.Adam(self.ttg.parameters(),   lr=args.lr,        weight_decay=1e-4)
@@ -894,9 +920,11 @@ def evaluate_ranking(bagging: "BaggingReranker",
 
 
 def print_ranking_table(phase: str, epoch: int, result: Dict[str, dict], k: int = 20):
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         f"\n{'='*72}",
-        f"  Hit@{k} & NDCG@{k} | {phase}  Epoch {epoch}",
+        f"  [{ts}]  Hit@{k} & NDCG@{k} | {phase}  Epoch {epoch}",
         f"{'='*72}",
         f"  {'Model':<12}  {'Hit':>6}/{'Total':<6}  {'Hit@K':>7}  {'NDCG@K':>8}",
         f"  {'-'*56}",
@@ -907,7 +935,9 @@ def print_ranking_table(phase: str, epoch: int, result: Dict[str, dict], k: int 
             f"{v['hit_rate']*100:>6.2f}%  {v['ndcg']*100:>7.3f}%"
         )
     lines.append("=" * 72)
-    logger.info("\n".join(lines))
+    text = "\n".join(lines)
+    logger.info(text)        # 写入主日志（nohup.log / train_bagging.log）
+    _eval_logger.info(text)  # 同时写入 eval_results.txt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
