@@ -43,7 +43,8 @@ def load_config(config_path: str) -> dict:
 
 def get_dataset_name(cfg: dict) -> str:
     """从 config 中读取 dataset 名称（兼容不同 config 字段名）。"""
-    for key in ("dataset", "dataset_name", "data", "hf_dataset"):
+    for key in ("conversation_dataset_name", "test_dataset_name",
+                "dataset", "dataset_name", "data", "hf_dataset"):
         if key in cfg:
             return cfg[key]
     raise ValueError(f"Cannot find dataset name in config: {cfg}")
