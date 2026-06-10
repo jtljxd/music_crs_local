@@ -39,8 +39,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-K_LIST   = [20, 50, 100, 200, 300, 400, 500]
-CHANNELS = ["ch1", "ch3", "ch5", "union"]
+K_LIST        = [20, 50, 100, 200, 300, 400, 500]
+CHANNELS      = ["ch1", "ch3", "ch5", "union"]
+# merged@K = ch1[:K] ∪ ch3[:K] ∪ ch5[:K] 去重，最多 3K 条
+# 用于公平对比"各路各取 top-K 合并后"的召回上限
+MERGED_K_LIST = [20, 50, 100, 200, 300]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +102,12 @@ def evaluate_split(dataset_name: str,
     hits_by_turn  = defaultdict(new_counter)   # turn_num → counter
     total_by_turn = defaultdict(lambda: {ch: 0 for ch in channels})
 
+    # merged@K: ch1[:K] ∪ ch3[:K] ∪ ch5[:K] 去重
+    hits_merged_all     = {k: 0 for k in MERGED_K_LIST}
+    total_merged_all    = 0
+    hits_merged_by_turn = defaultdict(lambda: {k: 0 for k in MERGED_K_LIST})
+    total_merged_by_turn = defaultdict(int)
+
     n_sessions    = 0
     n_turns_total = 0
     missing_retr  = 0   # 有 music turn 但找不到召回结果
@@ -144,6 +153,19 @@ def evaluate_split(dataset_name: str,
                     hits_all[ch][k]              += hit
                     hits_by_turn[turn_num][ch][k] += hit
 
+            # merged@K: ch1[:K] ∪ ch3[:K] ∪ ch5[:K] 去重
+            c1 = ch_cands["ch1"]
+            c3 = ch_cands["ch3"]
+            c5 = ch_cands["ch5"]
+            if c1 or c3 or c5:
+                total_merged_all += 1
+                total_merged_by_turn[turn_num] += 1
+                for k in MERGED_K_LIST:
+                    merged = list(dict.fromkeys(c1[:k] + c3[:k] + c5[:k]))  # 保序去重
+                    hit = 1 if gt_tid in merged else 0
+                    hits_merged_all[k]              += hit
+                    hits_merged_by_turn[turn_num][k] += hit
+
     logger.info("[%s] sessions=%d  music_turns=%d  missing_retr=%d",
                 split, n_sessions, n_turns_total, missing_retr)
 
@@ -162,12 +184,22 @@ def evaluate_split(dataset_name: str,
             t: to_recall(hits_by_turn[t], total_by_turn[t])
             for t in sorted(hits_by_turn.keys())
         },
+        "merged_all": {
+            k: hits_merged_all[k] / max(total_merged_all, 1)
+            for k in MERGED_K_LIST
+        },
+        "merged_by_turn": {
+            t: {k: hits_merged_by_turn[t][k] / max(total_merged_by_turn[t], 1)
+                for k in MERGED_K_LIST}
+            for t in sorted(hits_merged_by_turn.keys())
+        },
         "meta": {
-            "split":        split,
-            "n_sessions":   n_sessions,
-            "n_turns_total": n_turns_total,
-            "missing_retr": missing_retr,
-            "total_all":    total_all,
+            "split":          split,
+            "n_sessions":     n_sessions,
+            "n_turns_total":  n_turns_total,
+            "missing_retr":   missing_retr,
+            "total_all":      total_all,
+            "total_merged":   total_merged_all,
         }
     }
     return result
@@ -195,26 +227,39 @@ def format_table(result: dict, title: str) -> str:
         f"{'='*60}",
         "",
         "── ALL TURNS (全量) " + "─" * 40,
-        f"  {'Channel':<12}  {hdr}",
+        f"  {'Channel':<14}  {hdr}",
         "-" * len(sep),
     ]
     for ch in chs:
         row = result["all"][ch]
         vals = "  ".join(f"{row[k]*100:>{col_w-1}.2f}%" for k in k_list)
         n    = meta["total_all"].get(ch, 0)
-        lines.append(f"  {ch:<12}  {vals}   (n={n})")
+        lines.append(f"  {ch:<14}  {vals}   (n={n})")
+
+    # merged 行：各路各取 top-K 去重后的联合召回
+    merged_hdr = "  ".join(f"@{k:<{col_w-2}}" for k in MERGED_K_LIST)
+    lines.append("")
+    lines.append(f"  {'merged(去重)':<14}  {merged_hdr}   (ch1[:K]∪ch3[:K]∪ch5[:K], 最多3K条)")
+    lines.append("  " + "-" * (12 + (col_w + 2) * len(MERGED_K_LIST)))
+    mrow = result["merged_all"]
+    mvals = "  ".join(f"{mrow[k]*100:>{col_w-1}.2f}%" for k in MERGED_K_LIST)
+    lines.append(f"  {'merged':<14}  {mvals}   (n={meta['total_merged']})")
     lines.append("")
 
     # by turn
     lines.append("── BY TURN (分轮次) " + "─" * 40)
     for turn_num, turn_data in result["by_turn"].items():
         lines.append(f"  Turn {turn_num}:")
-        lines.append(f"    {'Channel':<10}  {hdr}")
+        lines.append(f"    {'Channel':<12}  {hdr}")
         lines.append("    " + "-" * (len(sep) - 4))
         for ch in chs:
             row  = turn_data[ch]
             vals = "  ".join(f"{row[k]*100:>{col_w-1}.2f}%" for k in k_list)
-            lines.append(f"    {ch:<10}  {vals}")
+            lines.append(f"    {ch:<12}  {vals}")
+        # merged for this turn
+        mrow  = result["merged_by_turn"].get(turn_num, {k: 0.0 for k in MERGED_K_LIST})
+        mvals = "  ".join(f"{mrow[k]*100:>{col_w-1}.2f}%" for k in MERGED_K_LIST)
+        lines.append(f"    {'merged':<12}  {mvals}   (ch1∪ch3∪ch5, 各取top-K去重)")
         lines.append("")
 
     lines.append(f"[generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
