@@ -173,9 +173,20 @@ def main(args):
     )
     logger.info("Dataset: %s", dataset_name)
 
+    track_emb_db  = config.get("track_emb_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings")
+    track_meta_db = config.get("item_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
+    user_emb_db   = config.get("user_emb_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-User-Embeddings")
+    user_meta_db  = config.get("user_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-User-Metadata")
+    split_types   = list(config.get("track_split_types", ["all_tracks"]))
+
     # ── 2. 加载 FeatureStore ────────────────────────────────────────────────
     logger.info("Loading FeatureStore ...")
-    feat_store = FeatureStore(config, dataset_name="train")
+    feat_store = FeatureStore(track_emb_db, track_meta_db,
+                              user_emb_db, user_meta_db, split_types)
 
     # ── 3. 加载对话 embedding ───────────────────────────────────────────────
     logger.info("Loading conv embeddings from %s ...", args.conv_emb)
