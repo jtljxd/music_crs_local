@@ -824,26 +824,29 @@ def evaluate_ranking(bagging: "BaggingReranker",
                      conv_emb_store: Dict,
                      retrieval_store: Optional[Dict],
                      feat_store: "FeatureStore",
-                     max_sessions: int = 400,
+                     max_sessions: int = 1000,
                      k: int = 20) -> Dict[str, dict]:
     """
-    统计各排序模型的 Hit@K 和 NDCG@K。
+    统计各排序模型的 Recall@K 和 NDCG@K。
+    评估策略：每个 session 只取最后一个 user query 对应的 music turn。
     直接用真实召回池，不强制插入 gt。
-    gt 不在召回池时：Hit=0, NDCG=0（真实代价）。
+    gt 不在召回池时：Recall=0, NDCG=0（真实代价）。
 
     返回:
-      {model_name: {"hit": int, "ndcg_sum": float, "total": int,
-                    "hit_rate": float, "ndcg": float}}
+      {model_name: {"hit": int, "recall_sum": float, "ndcg_sum": float, "total": int,
+                    "recall": float, "ndcg": float}}
     """
     ds = load_dataset(dataset_name, split=split)
     model_names = ["FM", "DCN", "xDeepFM", "LGBM", "TTGate", "Ensemble"]
-    hit_counts = {m: 0   for m in model_names}
-    ndcg_sums  = {m: 0.0 for m in model_names}
-    n_queries  = 0
-    n_sessions = 0
+    hit_counts   = {m: 0   for m in model_names}
+    recall_sums  = {m: 0.0 for m in model_names}
+    ndcg_sums    = {m: 0.0 for m in model_names}
+    n_queries    = 0
+    n_sessions   = 0
 
     for item in ds:
-        if n_sessions >= max_sessions: break
+        if n_sessions >= max_sessions:
+            break
         n_sessions += 1
         session_id = item["session_id"]
         user_id    = item.get("user_id")
@@ -854,65 +857,79 @@ def evaluate_ranking(bagging: "BaggingReranker",
                        for c in convs
                        if c.get("role") == "music" and c.get("content")}
 
-        for turn_num, gt_tid in music_turns.items():
-            fb_turn = turn_num + 1
-            if fb_turn not in asmt_map: continue
-            if asmt_map[fb_turn] not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"): continue
+        if not music_turns:
+            continue
 
-            emb_key = f"{session_id}_{turn_num}"
-            if emb_key not in conv_emb_store:
-                emb_key = f"{session_id}_{turn_num - 1}"
-            if emb_key not in conv_emb_store: continue
-            conv_emb = conv_emb_store[emb_key].float()
-            if conv_emb.shape[0] > CONV_EMB_DIM:
-                conv_emb = conv_emb[:CONV_EMB_DIM]
-            elif conv_emb.shape[0] < CONV_EMB_DIM:
-                conv_emb = F.pad(conv_emb, (0, CONV_EMB_DIM - conv_emb.shape[0]))
+        # ── 只取该 session 最后一个 music turn（对应最后一个 user query）────
+        last_music_turn = max(music_turns.keys())
+        gt_tid          = music_turns[last_music_turn]
+        turn_num        = last_music_turn
 
-            # 直接用真实召回池
-            cands: List[str] = []
-            if retrieval_store:
-                raw = (retrieval_store.get(emb_key)
-                       or retrieval_store.get(f"{session_id}_{turn_num}"))
-                if isinstance(raw, dict):
-                    cands = list(raw.get("union", []))
-                elif isinstance(raw, list):
-                    cands = list(raw)
-            if not cands:
-                continue
+        fb_turn = turn_num + 1
+        if fb_turn not in asmt_map:
+            continue
+        if asmt_map[fb_turn] not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"):
+            continue
 
-            n_queries += 1
-            feats = torch.stack([
-                feat_store.build_feature(user_id, tid, conv_emb, r, len(cands))
-                for r, tid in enumerate(cands)
-            ])
+        emb_key = f"{session_id}_{turn_num}"
+        if emb_key not in conv_emb_store:
+            emb_key = f"{session_id}_{turn_num - 1}"
+        if emb_key not in conv_emb_store:
+            continue
+        conv_emb = conv_emb_store[emb_key].float()
+        if conv_emb.shape[0] > CONV_EMB_DIM:
+            conv_emb = conv_emb[:CONV_EMB_DIM]
+        elif conv_emb.shape[0] < CONV_EMB_DIM:
+            conv_emb = F.pad(conv_emb, (0, CONV_EMB_DIM - conv_emb.shape[0]))
+
+        # 直接用真实召回池
+        cands: List[str] = []
+        if retrieval_store:
+            raw = (retrieval_store.get(emb_key)
+                   or retrieval_store.get(f"{session_id}_{turn_num}"))
+            if isinstance(raw, dict):
+                cands = list(raw.get("union", []))
+            elif isinstance(raw, list):
+                cands = list(raw)
+        if not cands:
+            continue
+
+        n_queries += 1
+        feats = torch.stack([
+            feat_store.build_feature(user_id, tid, conv_emb, r, len(cands))
+            for r, tid in enumerate(cands)
+        ])
+        with torch.no_grad():
             scores = bagging.predict_scores(feats)
 
-            def _score_query(scr):
-                ranked = torch.argsort(scr, descending=True).tolist()
-                rank = next((i for i, idx in enumerate(ranked) if cands[idx] == gt_tid), len(cands))
-                return rank
+        def _score_query(scr):
+            ranked = torch.argsort(scr, descending=True).tolist()
+            rank = next((i for i, idx in enumerate(ranked) if cands[idx] == gt_tid), len(cands))
+            return rank
 
-            for mname, scr in scores.items():
-                rank = _score_query(scr)
-                if rank < k:
-                    hit_counts[mname] += 1
-                ndcg_sums[mname] += _ndcg_at_k_single(rank, k)
+        for mname, scr in scores.items():
+            rank = _score_query(scr)
+            hit  = 1 if rank < k else 0
+            hit_counts[mname]  += hit
+            recall_sums[mname] += hit          # Recall@K = Hit@K for single-positive
+            ndcg_sums[mname]   += _ndcg_at_k_single(rank, k)
 
-            # ensemble
-            ens_score = sum(scores[m] for m in ["FM", "DCN", "xDeepFM", "LGBM", "TTGate"]) * ENSEMBLE_W
-            rank_ens = _score_query(ens_score)
-            if rank_ens < k:
-                hit_counts["Ensemble"] += 1
-            ndcg_sums["Ensemble"] += _ndcg_at_k_single(rank_ens, k)
+        # ensemble
+        ens_score = sum(scores[m] for m in ["FM", "DCN", "xDeepFM", "LGBM", "TTGate"]) * ENSEMBLE_W
+        rank_ens  = _score_query(ens_score)
+        hit_ens   = 1 if rank_ens < k else 0
+        hit_counts["Ensemble"]  += hit_ens
+        recall_sums["Ensemble"] += hit_ens
+        ndcg_sums["Ensemble"]   += _ndcg_at_k_single(rank_ens, k)
 
     result = {
         m: {
-            "hit":      hit_counts[m],
-            "ndcg_sum": ndcg_sums[m],
-            "total":    n_queries,
-            "hit_rate": hit_counts[m] / max(n_queries, 1),
-            "ndcg":     ndcg_sums[m]  / max(n_queries, 1),
+            "hit":        hit_counts[m],
+            "recall_sum": recall_sums[m],
+            "ndcg_sum":   ndcg_sums[m],
+            "total":      n_queries,
+            "recall":     recall_sums[m] / max(n_queries, 1),
+            "ndcg":       ndcg_sums[m]   / max(n_queries, 1),
         }
         for m in model_names
     }
@@ -923,18 +940,18 @@ def print_ranking_table(phase: str, epoch: int, result: Dict[str, dict], k: int 
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        f"\n{'='*72}",
-        f"  [{ts}]  Hit@{k} & NDCG@{k} | {phase}  Epoch {epoch}",
-        f"{'='*72}",
-        f"  {'Model':<12}  {'Hit':>6}/{'Total':<6}  {'Hit@K':>7}  {'NDCG@K':>8}",
-        f"  {'-'*56}",
+        f"\n{'='*80}",
+        f"  [{ts}]  Recall@{k} & NDCG@{k} | {phase}  Epoch {epoch}",
+        f"{'='*80}",
+        f"  {'Model':<12}  {'Hit':>6}/{'Total':<6}  {'Recall@K':>9}  {'NDCG@K':>8}",
+        f"  {'-'*62}",
     ]
     for m, v in result.items():
         lines.append(
             f"  {m:<12}  {v['hit']:>6}/{v['total']:<6}  "
-            f"{v['hit_rate']*100:>6.2f}%  {v['ndcg']*100:>7.3f}%"
+            f"{v['recall']*100:>8.2f}%  {v['ndcg']*100:>7.3f}%"
         )
-    lines.append("=" * 72)
+    lines.append("=" * 80)
     text = "\n".join(lines)
     logger.info(text)        # 写入主日志（nohup.log / train_bagging.log）
     _eval_logger.info(text)  # 同时写入 eval_results.txt
@@ -1001,16 +1018,17 @@ def run_training(dataset_name: str,
                  feat_store: FeatureStore,
                  ckpt_dir: str):
     """
-    交替训练流程，共 args.train_epochs 轮：
+    训练流程（仅在 train 上训练，共 args.train_epochs 轮）：
 
       for epoch in 1..train_epochs:
         1. LGBM fit (train)
         2. 神经网络 1 epoch (train，lr=args.lr)
-        3. 在 test 上评估 NDCG@20（各模型 + ensemble）
-        4. LGBM fit (test)
-        5. 神经网络 1 epoch (test，lr=args.lr_finetune)
-        6. 在 test 上再次评估 NDCG@20
-        7. 恢复 lr=args.lr，保存 checkpoint
+        3. 在 test 上评估 Recall@20 + NDCG@20（各子模型 + ensemble）
+           - 每个 session 只取最后一个 user query
+           - 统计 1000 个 sessions
+        4. 保存 checkpoint
+
+    不在 test 上 fine-tune，保证 test 指标干净可信。
     """
     total_epochs = args.train_epochs
 
@@ -1023,36 +1041,15 @@ def run_training(dataset_name: str,
         _fit_lgbm("train", train_samples, bagging, args)
         _train_one_epoch("TRAIN", epoch, total_epochs, train_samples, bagging, args)
 
-        # ── Step 3: Evaluate on test ──────────────────────────────────────
-        logger.info("[Epoch %d] === Evaluating after TRAIN epoch ===", epoch)
-        result_after_train = evaluate_ranking(
+        # ── Step 3: Evaluate on test（last-query only, 1000 sessions）─────
+        logger.info("[Epoch %d] === Evaluating on test (last query / 1000 sessions) ===", epoch)
+        result = evaluate_ranking(
             bagging, dataset_name, "test",
             test_conv_emb, test_retrieval, feat_store,
-            max_sessions=400, k=20)
-        print_ranking_table(f"After-Train-E{epoch}", epoch, result_after_train, k=20)
+            max_sessions=1000, k=20)
+        print_ranking_table(f"Train-E{epoch}", epoch, result, k=20)
 
-        if test_samples:
-            # ── Step 4+5: LGBM + neural on test (fine-tune lr) ───────────
-            _fit_lgbm("test", test_samples, bagging, args)
-            for opt in [bagging.opt_fm, bagging.opt_dcn,
-                        bagging.opt_xdfm, bagging.opt_ttg]:
-                for pg in opt.param_groups: pg["lr"] = args.lr_finetune
-            _train_one_epoch("TEST-FT", epoch, total_epochs, test_samples, bagging, args)
-
-            # 恢复 lr
-            for opt in [bagging.opt_fm, bagging.opt_dcn,
-                        bagging.opt_xdfm, bagging.opt_ttg]:
-                for pg in opt.param_groups: pg["lr"] = args.lr
-
-            # ── Step 6: Evaluate again ────────────────────────────────────
-            logger.info("[Epoch %d] === Evaluating after TEST-FT epoch ===", epoch)
-            result_after_test = evaluate_ranking(
-                bagging, dataset_name, "test",
-                test_conv_emb, test_retrieval, feat_store,
-                max_sessions=400, k=20)
-            print_ranking_table(f"After-TestFT-E{epoch}", epoch, result_after_test, k=20)
-
-        # ── Step 7: Checkpoint ────────────────────────────────────────────
+        # ── Step 4: Checkpoint ────────────────────────────────────────────
         bagging.save(os.path.join(ckpt_dir, f"epoch{epoch}"))
         logger.info("[Epoch %d] Checkpoint saved to %s/epoch%d", epoch, ckpt_dir, epoch)
 
@@ -1106,7 +1103,7 @@ def main(args):
     ckpt_dir = args.checkpoint_dir
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # ── Phase 1 & 2: 交替训练（train epoch → eval → test epoch → eval）────
+    # ── Phase: 在 train 上训练 5 epochs，每 epoch 后在 test 上评估 ─────────
     run_training(dataset_name, train_samples, test_samples,
                  bagging, args, test_ce, test_retr, feat_store, ckpt_dir)
 
@@ -1128,12 +1125,12 @@ def parse_args():
     p.add_argument("--retrieval_train",  type=str, default="qwen/retrieval_train_candidates.pt",
                    help="Pre-saved retrieval candidates dict {emb_key: [track_id, ...]}")
     p.add_argument("--retrieval_test",   type=str, default="qwen/retrieval_test_candidates.pt")
-    p.add_argument("--train_epochs",     type=int,   default=5)
-    p.add_argument("--test_epochs",      type=int,   default=5,
-                   help="Kept for compatibility; test fine-tune is now 1 pass per train epoch")
+    p.add_argument("--train_epochs",     type=int,   default=5,
+                   help="Number of training epochs on train split (eval on test after each)")
     p.add_argument("--batch_size",       type=int,   default=64)
     p.add_argument("--lr",               type=float, default=1e-3)
-    p.add_argument("--lr_finetune",      type=float, default=3e-4)
+    p.add_argument("--lr_finetune",      type=float, default=3e-4,
+                   help="Kept for compatibility (not used in current training loop)")
     p.add_argument("--lgbm_max_samples", type=int,   default=80000,
                    help="Max samples for LightGBM training per phase (default 80000)")
     p.add_argument("--checkpoint_dir",   type=str,   default="qwen/bagging_ckpt")
