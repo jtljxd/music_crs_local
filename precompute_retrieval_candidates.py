@@ -169,6 +169,9 @@ def retrieve_bm25(bm25_model, bm25_ids, user_query, qs_dict, topk):
 def main(args):
     config       = OmegaConf.load(args.config)
     dataset_name = config.get("conversation_dataset_name","talkpl-ai/TalkPlayData-Challenge-Dataset")
+    if args.dataset:
+        dataset_name = args.dataset
+        logger.info("Dataset overridden by --dataset: %s", dataset_name)
     track_emb_db = config.get("track_emb_db_name","talkpl-ai/TalkPlayData-Challenge-Track-Embeddings")
     track_meta_db= config.get("item_db_name","talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
     user_emb_db  = config.get("user_emb_db_name","talkpl-ai/TalkPlayData-Challenge-User-Embeddings")
@@ -275,11 +278,24 @@ def main(args):
         convs=item["conversations"]
         music_turns={int(c["turn_number"]):c["content"] for c in convs if c.get("role")=="music" and c.get("content")}
 
+        # blind-A 没有 music turn，改为用最后一个 user turn 作为目标
+        if not music_turns:
+            user_turns=[int(c["turn_number"]) for c in convs if c.get("role")=="user"]
+            if not user_turns: continue
+            target_turn=max(user_turns)
+            music_turns={target_turn: None}  # 用 None 占位，只做召回
+
         for turn_num,_ in music_turns.items():
             emb_key=f"{session_id}_{turn_num}"
             user_turn=turn_num
             if emb_key not in conv_store:
-                emb_key=f"{session_id}_{turn_num-1}"; user_turn=turn_num-1
+                # 往前找最近的可用 key
+                for t in range(turn_num-1, -1, -1):
+                    k=f"{session_id}_{t}"
+                    if k in conv_store:
+                        emb_key=k; user_turn=t; break
+                else:
+                    continue
             if emb_key not in conv_store: continue
             conv_emb=conv_store[emb_key].float()
             if conv_emb.shape[0]>CONV_EMB_DIM: conv_emb=conv_emb[:CONV_EMB_DIM]
@@ -347,6 +363,8 @@ def main(args):
 def parse_args():
     p=argparse.ArgumentParser()
     p.add_argument("--config",           type=str, default="config/llama1b_multi_channel_devset.yaml")
+    p.add_argument("--dataset",          type=str, default=None,
+                   help="Override conversation_dataset_name from config (e.g. talkpl-ai/TalkPlayData-Challenge-Blind-A)")
     p.add_argument("--conv_emb_store",   type=str, default="qwen/hist_conversation_embeddings_train_0.6b.pt")
     p.add_argument("--query_split_store",type=str, default="qwen/query_split_train.pt")
     p.add_argument("--cf_model_path",    type=str, default="qwen/cf_bpr_retrieval/model.pt")
