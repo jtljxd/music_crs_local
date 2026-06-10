@@ -225,8 +225,8 @@ def run_inference(
             conv_emb = F.pad(conv_emb, (0, CONV_EMB_DIM - conv_emb.shape[0]))
 
         feats = torch.stack([
-            feat_store.build_feature(p["user_id"], tid, conv_emb, r, len(cands))
-            for r, tid in enumerate(cands)
+            feat_store.build_feature(p["user_id"], tid, conv_emb)
+            for tid in cands
         ])
         with torch.no_grad():
             scores_dict = bagging.predict_scores(feats)

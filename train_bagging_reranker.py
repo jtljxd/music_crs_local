@@ -93,7 +93,7 @@ _eval_logger.addHandler(_eval_fh)
 CONV_EMB_DIM   = 1024
 CF_BPR_DIM     = 128
 AUDIO_DIM      = 512
-IMAGE_DIM      = 1152
+IMAGE_DIM      = 768
 ATTR_DIM       = 1024
 LYRICS_DIM     = 1024
 META_DIM       = 1024
@@ -107,28 +107,29 @@ CAND_PER_CH    = 100  # 取每路前100条组成候选集(300总)
 # ID hash bucket sizes
 USER_ID_BUCKETS  = 65536
 TRACK_ID_BUCKETS = 65536
-USER_SPLIT_BUCKETS = 4   # train/test/val/unknown
-PREF_LANG_BUCKETS  = 64
+PREF_LANG_BUCKETS    = 64
 PREF_CULTURE_BUCKETS = 128
 
-# New user/item id feature dims (one-hot too large → use emb-style hash onehot small buckets)
+# User/item id feature dims
 USER_ID_DIM      = 32   # hash(user_id, 32) → one-hot(32)
 TRACK_ID_DIM     = 32
-USER_SPLIT_DIM   = 4
+AGE_GROUP_DIM    = 8    # hash bucket → one-hot(8)
+GENDER_DIM       = 2    # male/female/unknown → one-hot(2)
 PREF_LANG_DIM    = 16
 PREF_CULTURE_DIM = 32
 
-# Updated user/item side dims
-# user: cf-bpr(128) + age_oh(32) + gender_oh(8) + country_oh(512)
-#       + user_id_oh(32) + split_oh(4) + pref_lang_oh(16) + pref_culture_oh(32) = 764
-USER_FEAT_DIM = CF_BPR_DIM + 32 + 8 + 512 + USER_ID_DIM + USER_SPLIT_DIM + PREF_LANG_DIM + PREF_CULTURE_DIM  # 764
-# item embs: cf-bpr(128)+audio(512)+image(1152)+attr(1024)+lyrics(1024)+meta(1024) = 4864
+# User/item side dims
+# user: cf-bpr(128) + age_oh(8) + gender_oh(2) + country_oh(512)
+#       + user_id_oh(32) + pref_lang_oh(16) + pref_culture_oh(32) = 730
+#       (split removed)
+USER_FEAT_DIM = CF_BPR_DIM + AGE_GROUP_DIM + GENDER_DIM + 512 + USER_ID_DIM + PREF_LANG_DIM + PREF_CULTURE_DIM  # 730
+# item embs: cf-bpr(128)+audio(512)+image(768)+attr(1024)+lyrics(1024)+meta(1024) = 4480
 # item id: track_id_oh(32)
-ITEM_EMB_DIM  = CF_BPR_DIM + AUDIO_DIM + IMAGE_DIM + ATTR_DIM + LYRICS_DIM + META_DIM + TRACK_ID_DIM  # 4896
-# scalars: pop(1)+dur(1)+year(1)+tags(50)+bpr_cos(1)+rank_n(1) = 55
-SCALAR_DIM    = 3 + TOP_TAGS + 2  # 55
+ITEM_EMB_DIM  = CF_BPR_DIM + AUDIO_DIM + IMAGE_DIM + ATTR_DIM + LYRICS_DIM + META_DIM + TRACK_ID_DIM  # 4512
+# scalars: pop(1)+dur(1)+year(1)+tags(50)+bpr_cos(1) = 54
+SCALAR_DIM    = 3 + TOP_TAGS + 1  # 54
 # total
-FEATURE_DIM   = USER_FEAT_DIM + ITEM_EMB_DIM + SCALAR_DIM + CONV_EMB_DIM  # 764+4896+55+1024=6739
+FEATURE_DIM   = USER_FEAT_DIM + ITEM_EMB_DIM + SCALAR_DIM + CONV_EMB_DIM  # 730+4512+54+1024=6320
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,25 +226,24 @@ class FeatureStore:
         ds_um = load_dataset(user_meta_db)
         valid_um = [s for s in split_types if s in ds_um.keys()] or list(ds_um.keys())
         user_meta_ds = concatenate_datasets([ds_um[s] for s in valid_um])
-        for row in tqdm(user_meta_ds, desc="Loading user meta"):
+        for row in tqdm(user_meta_ds, desc="Loading user meta (1st pass)"):
             uid = row["user_id"]
             if uid not in self.user_data:
                 self.user_data[uid] = {"cf-bpr": torch.zeros(CF_BPR_DIM)}
-            self.user_data[uid]["age_idx"]     = _hash_bucket(str(row.get("age_group",    "") or ""), 32)
-            self.user_data[uid]["gender_idx"]  = _hash_bucket(str(row.get("gender",       "") or ""), 8)
+            self.user_data[uid]["age_idx"]     = _hash_bucket(str(row.get("age_group",    "") or ""), AGE_GROUP_DIM)
+            self.user_data[uid]["gender_idx"]  = _hash_bucket(str(row.get("gender",       "") or ""), GENDER_DIM)
             self.user_data[uid]["country_idx"] = _hash_bucket(str(row.get("country_name", "") or ""), 512)
 
-        for row in tqdm(user_meta_ds, desc="Loading user meta"):
+        for row in tqdm(user_meta_ds, desc="Loading user meta (2nd pass)"):
             uid = row["user_id"]
             if uid not in self.user_data:
                 self.user_data[uid] = {"cf-bpr": torch.zeros(CF_BPR_DIM)}
-            self.user_data[uid]["age_idx"]          = _hash_bucket(str(row.get("age_group",               "") or ""), 32)
-            self.user_data[uid]["gender_idx"]        = _hash_bucket(str(row.get("gender",                  "") or ""), 8)
-            self.user_data[uid]["country_idx"]       = _hash_bucket(str(row.get("country_name",            "") or ""), 512)
-            self.user_data[uid]["pref_lang_idx"]     = _hash_bucket(str(row.get("preferred_language",      "") or ""), PREF_LANG_BUCKETS)
-            self.user_data[uid]["pref_culture_idx"]  = _hash_bucket(str(row.get("preferred_musical_culture","") or ""), PREF_CULTURE_BUCKETS)
-            self.user_data[uid]["user_id_idx"]       = _hash_bucket(str(uid), USER_ID_BUCKETS) % USER_ID_DIM
-            self.user_data[uid]["split_idx"]         = _hash_bucket(str(row.get("split", "") or ""), USER_SPLIT_BUCKETS)
+            self.user_data[uid]["age_idx"]         = _hash_bucket(str(row.get("age_group",               "") or ""), AGE_GROUP_DIM)
+            self.user_data[uid]["gender_idx"]       = _hash_bucket(str(row.get("gender",                  "") or ""), GENDER_DIM)
+            self.user_data[uid]["country_idx"]      = _hash_bucket(str(row.get("country_name",            "") or ""), 512)
+            self.user_data[uid]["pref_lang_idx"]    = _hash_bucket(str(row.get("preferred_language",      "") or ""), PREF_LANG_BUCKETS)
+            self.user_data[uid]["pref_culture_idx"] = _hash_bucket(str(row.get("preferred_musical_culture","") or ""), PREF_CULTURE_BUCKETS)
+            self.user_data[uid]["user_id_idx"]      = _hash_bucket(str(uid), USER_ID_BUCKETS) % USER_ID_DIM
 
         for d in self.user_data.values():
             d.setdefault("age_idx",         0)
@@ -252,7 +252,6 @@ class FeatureStore:
             d.setdefault("pref_lang_idx",   0)
             d.setdefault("pref_culture_idx",0)
             d.setdefault("user_id_idx",     0)
-            d.setdefault("split_idx",       0)
 
         # track_id hash index
         for tid in self.track_data:
@@ -277,12 +276,10 @@ class FeatureStore:
     def build_feature(self,
                       user_id: Optional[str],
                       track_id: str,
-                      conv_emb: torch.Tensor,
-                      retrieval_rank: int = 0,
-                      retrieval_topk: int = 1) -> torch.Tensor:
+                      conv_emb: torch.Tensor) -> torch.Tensor:
         """
-        Full feature vector layout (6739d):
-          user(764) | item_emb+id(4896) | scalar(55) | query(1024)
+        Full feature vector layout (6320d):
+          user(730) | item_emb+id(4512) | scalar(54) | query(1024)
         """
         u  = self.user_data.get(user_id, {}) if user_id else {}
         t  = self.track_data.get(track_id, {})
@@ -290,14 +287,13 @@ class FeatureStore:
 
         # ── user side ────────────────────────────────────────────────────
         u_cf  = u.get("cf-bpr", torch.zeros(CF_BPR_DIM)).float()
-        age_oh          = F.one_hot(torch.tensor(u.get("age_idx",         0)), 32).float()
-        gender_oh       = F.one_hot(torch.tensor(u.get("gender_idx",      0)), 8).float()
+        age_oh          = F.one_hot(torch.tensor(u.get("age_idx",         0) % AGE_GROUP_DIM),    AGE_GROUP_DIM).float()
+        gender_oh       = F.one_hot(torch.tensor(u.get("gender_idx",      0) % GENDER_DIM),       GENDER_DIM).float()
         country_oh      = F.one_hot(torch.tensor(u.get("country_idx",     0)), 512).float()
         user_id_oh      = F.one_hot(torch.tensor(u.get("user_id_idx",     0)), USER_ID_DIM).float()
-        split_oh        = F.one_hot(torch.tensor(u.get("split_idx",       0)), USER_SPLIT_DIM).float()
         pref_lang_oh    = F.one_hot(torch.tensor(u.get("pref_lang_idx",   0)), PREF_LANG_DIM).float()
         pref_culture_oh = F.one_hot(torch.tensor(u.get("pref_culture_idx",0)), PREF_CULTURE_DIM).float()
-        # user total: 128+32+8+512+32+4+16+32 = 764
+        # user total: 128+8+2+512+32+16+32 = 730  (split removed)
 
         # ── item side ────────────────────────────────────────────────────
         t_cf    = t.get("cf-bpr",  torch.zeros(CF_BPR_DIM)).float()
@@ -307,7 +303,7 @@ class FeatureStore:
         lyrics  = t.get("lyrics",  torch.zeros(LYRICS_DIM)).float()
         meta    = t.get("meta",    torch.zeros(META_DIM)).float()
         track_id_oh = F.one_hot(torch.tensor(t.get("track_id_idx", 0)), TRACK_ID_DIM).float()
-        # item total: 128+512+1152+1024+1024+1024+32 = 4896
+        # item total: 128+512+768+1024+1024+1024+32 = 4512
 
         # ── scalars ──────────────────────────────────────────────────────
         pop     = torch.tensor([_safe_float(tm.get("popularity",    0)) / 100.0])
@@ -319,98 +315,249 @@ class FeatureStore:
         u_n     = F.normalize(u_cf.unsqueeze(0), p=2, dim=1).squeeze(0)
         t_n     = F.normalize(t_cf.unsqueeze(0), p=2, dim=1).squeeze(0)
         bpr_cos = torch.dot(u_n, t_n).unsqueeze(0)
-        rank_n  = torch.tensor([retrieval_rank / max(retrieval_topk - 1, 1)])
 
         return torch.cat([
-            # user (764)
+            # user (730)
             u_cf, age_oh, gender_oh, country_oh,
-            user_id_oh, split_oh, pref_lang_oh, pref_culture_oh,
-            # item embs + id (4896)
+            user_id_oh, pref_lang_oh, pref_culture_oh,
+            # item embs + id (4512)
             t_cf, audio, image, attr, lyrics, meta, track_id_oh,
-            # scalars (55)
-            pop, dur, year, tags, bpr_cos, rank_n,
+            # scalars (54)
+            pop, dur, year, tags, bpr_cos,
             # query (1024)
             conv_emb.float(),
         ], dim=0)
 
     @property
     def feature_dim(self) -> int:
-        return FEATURE_DIM  # 6739
+        return FEATURE_DIM  # 6320
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Sub-models
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Feature field offsets (used by FM / DCN / xDeepFM for field-aware projection)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Full layout (6320d):
+#   user_cf_bpr   [0:128]          128d   field 0
+#   age_oh        [128:136]          8d   field 1
+#   gender_oh     [136:138]          2d   field 2
+#   country_oh    [138:650]        512d   field 3
+#   user_id_oh    [650:682]         32d   field 4
+#   pref_lang_oh  [682:698]         16d   field 5
+#   pref_cul_oh   [698:730]         32d   field 6
+#   item_cf_bpr   [730:858]        128d   field 7
+#   audio         [858:1370]       512d   field 8
+#   image         [1370:2138]      768d   field 9
+#   attr          [2138:3162]     1024d   field 10
+#   lyrics        [3162:4186]     1024d   field 11
+#   meta          [4186:5210]     1024d   field 12
+#   track_id_oh   [5210:5242]      32d   field 13
+#   pop           [5242:5243]       1d   field 14
+#   dur           [5243:5244]       1d   field 15
+#   year          [5244:5245]       1d   field 16
+#   tags          [5245:5295]      50d   field 17
+#   bpr_cos       [5295:5296]       1d   field 18
+#   conv_emb      [5296:6320]     1024d  field 19
+#
+# Fields 0-6:   user side  (7 fields, dims: 128/8/2/512/32/16/32)
+# Fields 7-13:  item side  (7 fields, dims: 128/512/768/1024/1024/1024/32)
+# Fields 14-18: scalars    (5 fields, dims: 1/1/1/50/1)
+# Field 19:     query      (1 field,  dim: 1024)
+#
+# "Large" embedding fields (need projection to FIELD_DIM=32):
+#   field 3  country_oh  512d
+#   field 7  item_cf_bpr 128d
+#   field 8  audio       512d
+#   field 9  image       768d
+#   field 10 attr        1024d
+#   field 11 lyrics      1024d
+#   field 12 meta        1024d
+#   field 19 conv_emb    1024d
+#
+# "Small" fields (pad/truncate to FIELD_DIM=32):
+#   0 user_cf_bpr 128  → slice [:32]  (or project)
+#   1 age         8    → pad to 32
+#   2 gender      2    → pad to 32
+#   4 user_id_oh  32   → exact
+#   5 pref_lang   16   → pad to 32
+#   6 pref_cul    32   → exact
+#   13 track_id   32   → exact
+#   14 pop        1    → pad to 32
+#   15 dur        1    → pad to 32
+#   16 year       1    → pad to 32
+#   17 tags       50   → slice [:32]
+#   18 bpr_cos    1    → pad to 32
+
+FIELD_DIM  = 32   # each field projected / padded to this dim
+N_FIELDS   = 20   # total number of feature fields
+
+# Field boundaries in the flat 6320d vector
+_FIELD_SLICES = [
+    (0,    128),   # 0  user_cf_bpr
+    (128,  136),   # 1  age_oh
+    (136,  138),   # 2  gender_oh
+    (138,  650),   # 3  country_oh
+    (650,  682),   # 4  user_id_oh
+    (682,  698),   # 5  pref_lang_oh
+    (698,  730),   # 6  pref_cul_oh
+    (730,  858),   # 7  item_cf_bpr
+    (858,  1370),  # 8  audio
+    (1370, 2138),  # 9  image
+    (2138, 3162),  # 10 attr
+    (3162, 4186),  # 11 lyrics
+    (4186, 5210),  # 12 meta
+    (5210, 5242),  # 13 track_id_oh
+    (5242, 5243),  # 14 pop
+    (5243, 5244),  # 15 dur
+    (5244, 5245),  # 16 year
+    (5245, 5295),  # 17 tags
+    (5295, 5296),  # 18 bpr_cos
+    (5296, 6320),  # 19 conv_emb
+]
+_FIELD_DIMS = [e - s for s, e in _FIELD_SLICES]
+# fields that need an MLP projection (dim > FIELD_DIM)
+_PROJ_FIELDS = {i for i, d in enumerate(_FIELD_DIMS) if d > FIELD_DIM}
+
+
+def _make_field_projectors(dropout: float = 0.1) -> nn.ModuleList:
+    """
+    Build one projector per field.
+    - fields with dim > FIELD_DIM: Linear(dim → FIELD_DIM) + LayerNorm + ReLU
+    - fields with dim == FIELD_DIM: Identity
+    - fields with dim < FIELD_DIM: Linear(dim → FIELD_DIM)  (simple embed)
+    Each call creates *independent* weights (no sharing between models).
+    """
+    mods = []
+    for d in _FIELD_DIMS:
+        if d == FIELD_DIM:
+            mods.append(nn.Identity())
+        elif d > FIELD_DIM:
+            mods.append(nn.Sequential(
+                nn.Linear(d, FIELD_DIM),
+                nn.LayerNorm(FIELD_DIM),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ))
+        else:
+            mods.append(nn.Linear(d, FIELD_DIM))
+    return nn.ModuleList(mods)
+
+
+def _project_fields(x: torch.Tensor,
+                    projectors: nn.ModuleList) -> torch.Tensor:
+    """
+    x : [B, 6320]
+    returns : [B, N_FIELDS, FIELD_DIM]  (20 × 32 field embeddings)
+    """
+    parts = []
+    for i, (s, e) in enumerate(_FIELD_SLICES):
+        field_val = x[:, s:e]                  # [B, field_dim]
+        parts.append(projectors[i](field_val))  # [B, FIELD_DIM]
+    return torch.stack(parts, dim=1)            # [B, N_FIELDS, FIELD_DIM]
+
+
 # ── 1. FM ────────────────────────────────────────────────────────────────────
 
 class FMModel(nn.Module):
     """
-    DeepFM-style FM：先用 MLP 将 dense 输入压缩到低维空间，
-    再对压缩后的特征做 FM 二阶交叉 + 线性项。
-    这样避免直接对 6739d dense 向量做平方累加导致数值爆炸。
+    Field-aware FM:
+      1. 每个特征字段独立投影到 FIELD_DIM(32) 维
+      2. FM 二阶交叉: sum_i sum_j <v_i, v_j>  (via square-of-sum trick)
+      3. Linear: 对所有 field embedding 求和后线性打分
+      4. Bias
+    输出: 标量得分 [B]
     """
 
-    def __init__(self, input_dim: int, proj_dim: int = 256, k: int = 16,
-                 dropout: float = 0.2):
+    def __init__(self, dropout: float = 0.1):
         super().__init__()
-        # 压缩层：6739d → 1024 → proj_dim
-        self.proj = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(1024, proj_dim),
-            nn.BatchNorm1d(proj_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        # FM 部分（作用在压缩后的 proj_dim 维）
-        self.bias      = nn.Parameter(torch.zeros(1))
-        self.linear    = nn.Linear(proj_dim, 1, bias=False)
-        self.embedding = nn.Parameter(torch.empty(proj_dim, k))
-        nn.init.normal_(self.embedding, std=0.01)
+        self.projectors = _make_field_projectors(dropout)           # 独立投影，不共享
+        self.linear     = nn.Linear(N_FIELDS * FIELD_DIM, 1, bias=False)
+        self.bias       = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, D] → [B]
-        h = self.proj(x)                                   # [B, proj_dim]
-        lin = self.linear(h).squeeze(-1)                   # [B]
-        xv      = h @ self.embedding                       # [B, k]
-        sq_sum  = xv.pow(2).sum(1)                         # [B]
-        sum_sq  = (h.pow(2) @ self.embedding.pow(2)).sum(1)# [B]
-        return self.bias + lin + 0.5 * (sq_sum - sum_sq)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:            # [B, 6320] → [B]
+        fe = _project_fields(x, self.projectors)                   # [B, 20, 32]
+        B  = fe.shape[0]
+
+        # FM interaction: 0.5 * (||sum v_i||^2 - sum ||v_i||^2)
+        sum_of_emb = fe.sum(dim=1)                                 # [B, 32]
+        sq_sum     = sum_of_emb.pow(2).sum(dim=1)                  # [B]
+        sum_sq     = fe.pow(2).sum(dim=[1, 2])                     # [B]
+        fm_out     = 0.5 * (sq_sum - sum_sq)                       # [B]
+
+        # Linear part
+        lin_out = self.linear(fe.view(B, -1)).squeeze(-1)          # [B]
+
+        return self.bias + lin_out + fm_out
 
 
-# ── 2. DCN ───────────────────────────────────────────────────────────────────
+# ── 2. DCN-v2 (Full Matrix Cross) ────────────────────────────────────────────
 
-class CrossLayer(nn.Module):
+class CrossLayerV2(nn.Module):
+    """DCN-v2 full-matrix cross layer: x_l+1 = x0 ⊙ (W_l x_l + b_l) + x_l"""
+
     def __init__(self, dim: int):
         super().__init__()
-        self.w = nn.Linear(dim, dim, bias=True)
+        self.W = nn.Linear(dim, dim, bias=True)
 
     def forward(self, x0: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return x0 * self.w(x) + x
+        return x0 * self.W(x) + x
 
 
 class DCNModel(nn.Module):
-    """Deep & Cross Network: 3 cross layers + 3-layer MLP."""
+    """
+    DCN-v2 with field-aware compression:
+      1. 大 embedding 字段各自 Linear → 32d，与小字段 concat → 256d
+         (具体: 8 large fields × 32 + 12 small fields 合并 → LinearProj → 256d)
+      2. 3 层 DCN-v2 Full Matrix CrossLayer(256)
+      3. DNN: 256 → 128 → 64
+      4. concat(cross_out, dnn_out) → Linear → score
+    """
 
-    def __init__(self, input_dim: int, n_cross: int = 3,
-                 hidden: int = 256, dropout: float = 0.2):
+    def __init__(self, dropout: float = 0.1, cross_dim: int = 256):
         super().__init__()
-        self.cross_layers = nn.ModuleList([CrossLayer(input_dim) for _ in range(n_cross)])
-        self.deep = nn.Sequential(
-            nn.Linear(input_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2), nn.BatchNorm1d(hidden // 2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden // 2, 64),
-        )
-        self.out = nn.Linear(input_dim + 64, 1)
+        self.dropout    = dropout
+        self.cross_dim  = cross_dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xc = x
+        # ── 独立的字段投影（不与 FM/xDeepFM 共享）────────────────────────
+        self.projectors = _make_field_projectors(dropout)
+
+        # ── 把 20 个 32d field emb 拼成 640d → 压到 cross_dim ────────────
+        self.compress = nn.Sequential(
+            nn.Linear(N_FIELDS * FIELD_DIM, cross_dim),
+            nn.LayerNorm(cross_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # ── 3 层 DCN-v2 Full Matrix CrossLayer ───────────────────────────
+        self.cross_layers = nn.ModuleList([
+            CrossLayerV2(cross_dim) for _ in range(3)
+        ])
+
+        # ── Deep MLP: 256 → 128 → 64 ─────────────────────────────────────
+        self.deep = nn.Sequential(
+            nn.Linear(cross_dim, 128), nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64),        nn.LayerNorm(64),  nn.ReLU(), nn.Dropout(dropout),
+        )
+
+        # ── 输出层：concat(cross[256], deep[64]) → 1 ─────────────────────
+        self.out = nn.Linear(cross_dim + 64, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:            # [B, 6320] → [B]
+        fe = _project_fields(x, self.projectors)                   # [B, 20, 32]
+        B  = fe.shape[0]
+
+        h  = self.compress(fe.view(B, -1))                         # [B, 256]
+        xc = h
         for layer in self.cross_layers:
-            xc = layer(x, xc)
-        xd = self.deep(x)
-        return self.out(torch.cat([xc, xd], dim=1)).squeeze(-1)
+            xc = layer(h, xc)                                      # [B, 256]
+
+        xd = self.deep(h)                                          # [B, 64]
+        return self.out(torch.cat([xc, xd], dim=1)).squeeze(-1)    # [B]
 
 
 # ── 3. xDeepFM ───────────────────────────────────────────────────────────────
@@ -423,54 +570,63 @@ class CINLayer(nn.Module):
         self.conv = nn.Conv1d(n_fields_in * n_fields_0, n_units, kernel_size=1)
 
     def forward(self, h: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
-        # h: [B, n_in, D], x0: [B, n0, D]
         B, n_in, D = h.shape
-        n0 = x0.shape[1]
-        outer = h.unsqueeze(2) * x0.unsqueeze(1)  # [B, n_in, n0, D]
+        n0  = x0.shape[1]
+        outer = h.unsqueeze(2) * x0.unsqueeze(1)   # [B, n_in, n0, D]
         outer = outer.view(B, n_in * n0, D)
-        out   = self.conv(outer)                   # [B, n_units, D]
-        return out
+        return self.conv(outer)                     # [B, n_units, D]
 
 
 class xDeepFMModel(nn.Module):
-    """xDeepFM: CIN (2 layers) + DNN + linear."""
+    """
+    xDeepFM with field-aware projection:
+      1. 每个字段独立投影到 FIELD_DIM(32) → [B, 20, 32]
+      2. CIN=[64,64] (field interaction)
+      3. DNN=[256,128,64] (on flattened field embs [B, 640])
+      4. Linear part (on flattened [B, 640])
+      5. output = Linear(concat(dnn[64], cin[128], linear[1]))
+    """
 
-    def __init__(self, input_dim: int, cin_units: int = 32,
-                 hidden: int = 256, dropout: float = 0.2,
-                 emb_dim: int = 8, n_fields: int = 16):
+    def __init__(self, cin_units: int = 64, dropout: float = 0.1):
         super().__init__()
-        # project input to field embeddings
-        self.n_fields = n_fields
-        self.emb_dim  = emb_dim
-        self.proj     = nn.Linear(input_dim, n_fields * emb_dim)
+        self.projectors = _make_field_projectors(dropout)           # 独立，不共享
 
-        self.cin1 = CINLayer(n_fields, n_fields, cin_units)
-        self.cin2 = CINLayer(cin_units, n_fields, cin_units)
-
-        self.dnn = nn.Sequential(
-            nn.Linear(n_fields * emb_dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2), nn.BatchNorm1d(hidden // 2), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden // 2, 64),
-        )
-        cin_out_dim = cin_units * 2  # 2 CIN layers, each sum-pooled over emb_dim → [B, cin_units]
-        self.out = nn.Linear(64 + cin_out_dim + 1, 1)
-        self.linear = nn.Linear(input_dim, 1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        # field embeddings
-        fe = self.proj(x).view(B, self.n_fields, self.emb_dim)  # [B, nF, D]
         # CIN
-        h1 = self.cin1(fe, fe)                                    # [B, cu, D]
-        h2 = self.cin2(h1, fe)
-        cin_feat = torch.cat([
-            h1.sum(dim=2),   # [B, cu]
-            h2.sum(dim=2),   # [B, cu]
-        ], dim=1)
-        # DNN on projected field embs
-        dnn_out = self.dnn(fe.view(B, -1))                        # [B, 64]
-        lin_out = self.linear(x)                                   # [B, 1]
-        return self.out(torch.cat([dnn_out, cin_feat, lin_out], dim=1)).squeeze(-1)
+        self.cin1 = CINLayer(N_FIELDS,   N_FIELDS, cin_units)      # 20→64 units
+        self.cin2 = CINLayer(cin_units,  N_FIELDS, cin_units)      # 64→64 units
+        cin_out   = cin_units * 2                                   # 128
+
+        # DNN on flattened field embs
+        flat_dim = N_FIELDS * FIELD_DIM                            # 640
+        self.dnn = nn.Sequential(
+            nn.Linear(flat_dim, 256), nn.LayerNorm(256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, 128),      nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64),
+        )
+
+        # Linear part
+        self.linear_part = nn.Linear(flat_dim, 1, bias=True)
+
+        # Final output
+        self.out = nn.Linear(64 + cin_out + 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:            # [B, 6320] → [B]
+        fe  = _project_fields(x, self.projectors)                  # [B, 20, 32]
+        B   = fe.shape[0]
+        flat = fe.view(B, -1)                                      # [B, 640]
+
+        # CIN
+        h1 = self.cin1(fe, fe)                                     # [B, 64, 32]
+        h2 = self.cin2(h1, fe)                                     # [B, 64, 32]
+        cin_feat = torch.cat([h1.sum(dim=2), h2.sum(dim=2)], dim=1)  # [B, 128]
+
+        # DNN
+        dnn_out = self.dnn(flat)                                    # [B, 64]
+
+        # Linear
+        lin_out = self.linear_part(flat)                           # [B, 1]
+
+        return self.out(torch.cat([dnn_out, cin_feat, lin_out], dim=1)).squeeze(-1)  # [B]
 
 
 # ── 4. LightGBM wrapper (fit later, GPU not required) ────────────────────────
@@ -524,16 +680,16 @@ class LGBMWrapper:
 
 class ThreeTowerGate(nn.Module):
     """
-    User塔(764d→128) + Query塔(1024d→128) + Gate → fusion
-    Item塔(4896d → 128) + 召回特征(55d)
+    User塔(730d→128) + Query塔(1024d→128) + Gate → fusion
+    Item塔(4512d → 128) + scalar(54d)
     Score = MLP([fusion, item_repr, scalars])
     """
 
     def __init__(self,
-                 user_dim: int = USER_FEAT_DIM,   # 764
+                 user_dim: int = USER_FEAT_DIM,    # 730
                  query_dim: int = CONV_EMB_DIM,
-                 item_emb_dim: int = ITEM_EMB_DIM, # 4896
-                 scalar_dim: int = SCALAR_DIM,     # 55
+                 item_emb_dim: int = ITEM_EMB_DIM,  # 4512
+                 scalar_dim: int = SCALAR_DIM,      # 54
                  hidden: int = 256,
                  out_dim: int = 128,
                  dropout: float = 0.2):
@@ -587,9 +743,9 @@ class BaggingReranker:
         fd = feat_store.feature_dim
 
         # ── neural models ────────────────────────────────────────────────
-        self.fm      = FMModel(fd).to(device)
-        self.dcn     = DCNModel(fd).to(device)
-        self.xdfm    = xDeepFMModel(fd).to(device)
+        self.fm      = FMModel().to(device)
+        self.dcn     = DCNModel().to(device)
+        self.xdfm    = xDeepFMModel().to(device)
         self.ttg     = ThreeTowerGate().to(device)
         self.lgbm    = LGBMWrapper()
 
@@ -604,13 +760,13 @@ class BaggingReranker:
     def _split_feat(self, feat: torch.Tensor):
         """Split full feature into (user_feat, query_feat, item_feat, scalar_feat).
 
-        Layout (6739d):
-          user(764) | item_emb+id(4896) | scalars(55) | query(1024)
-          offsets: 0, 764, 5660, 5715, 5715+1024=6739
+        Layout (6320d):
+          user(730) | item_emb+id(4512) | scalars(54) | query(1024)
+          offsets: 0, 730, 5242, 5296, 6320
         """
-        a = USER_FEAT_DIM                    # 764
-        b = a + ITEM_EMB_DIM                 # 764+4896 = 5660
-        c = b + SCALAR_DIM                   # 5660+55  = 5715
+        a = USER_FEAT_DIM                    # 730
+        b = a + ITEM_EMB_DIM                 # 730+4512 = 5242
+        c = b + SCALAR_DIM                   # 5242+54  = 5296
         user_feat   = feat[:, :a]
         item_feat   = feat[:, a:b]
         scalar_feat = feat[:, b:c]
@@ -732,20 +888,12 @@ def build_samples(dataset_name: str, split: str,
         session_id = item["session_id"]
         user_id    = item.get("user_id")
         convs      = item["conversations"]
-        assessments= item.get("goal_progress_assessments", [])
-        asmt_map   = {int(a["turn_number"]): a.get("goal_progress_assessment")
-                      for a in assessments}
 
         music_turns = {int(c["turn_number"]): c["content"]
                        for c in convs
                        if c.get("role") == "music" and c.get("content")}
 
         for turn_num, gt_tid in music_turns.items():
-            fb_turn = turn_num + 1
-            if fb_turn not in asmt_map: continue
-            gpa = asmt_map[fb_turn]
-            if gpa not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"): continue
-
             emb_key = f"{session_id}_{turn_num}"
             if emb_key not in conv_emb_store:
                 emb_key = f"{session_id}_{turn_num - 1}"
@@ -774,21 +922,21 @@ def build_samples(dataset_name: str, split: str,
                     retr_pool = [t for t in pool if t != gt_tid]
 
             # positive
-            pos_feat = feat_store.build_feature(user_id, gt_tid, conv_emb, 0, 1)
+            pos_feat = feat_store.build_feature(user_id, gt_tid, conv_emb)
             samples.append({"feat": pos_feat, "label": 1.0,
                             "user_id": user_id, "track_id": gt_tid, "conv_emb": conv_emb})
 
             # retrieval negatives
             neg_retr = random.sample(retr_pool, min(num_retr_neg, len(retr_pool)))
-            for r, ntid in enumerate(neg_retr):
-                nf = feat_store.build_feature(user_id, ntid, conv_emb, r + 1, len(retr_pool) + 1)
+            for ntid in neg_retr:
+                nf = feat_store.build_feature(user_id, ntid, conv_emb)
                 samples.append({"feat": nf, "label": 0.0,
                                 "user_id": user_id, "track_id": ntid, "conv_emb": conv_emb})
 
             # global negatives
             for _ in range(num_global_neg):
                 ntid = random.choice(all_tids)
-                nf   = feat_store.build_feature(user_id, ntid, conv_emb, 0, 1)
+                nf   = feat_store.build_feature(user_id, ntid, conv_emb)
                 samples.append({"feat": nf, "label": 0.0,
                                 "user_id": user_id, "track_id": ntid, "conv_emb": conv_emb})
 
@@ -851,8 +999,6 @@ def evaluate_ranking(bagging: "BaggingReranker",
         session_id = item["session_id"]
         user_id    = item.get("user_id")
         convs      = item["conversations"]
-        asmt_map   = {int(a["turn_number"]): a.get("goal_progress_assessment")
-                      for a in item.get("goal_progress_assessments", [])}
         music_turns = {int(c["turn_number"]): c["content"]
                        for c in convs
                        if c.get("role") == "music" and c.get("content")}
@@ -864,12 +1010,6 @@ def evaluate_ranking(bagging: "BaggingReranker",
         last_music_turn = max(music_turns.keys())
         gt_tid          = music_turns[last_music_turn]
         turn_num        = last_music_turn
-
-        fb_turn = turn_num + 1
-        if fb_turn not in asmt_map:
-            continue
-        if asmt_map[fb_turn] not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"):
-            continue
 
         emb_key = f"{session_id}_{turn_num}"
         if emb_key not in conv_emb_store:
@@ -896,8 +1036,8 @@ def evaluate_ranking(bagging: "BaggingReranker",
 
         n_queries += 1
         feats = torch.stack([
-            feat_store.build_feature(user_id, tid, conv_emb, r, len(cands))
-            for r, tid in enumerate(cands)
+            feat_store.build_feature(user_id, tid, conv_emb)
+            for tid in cands
         ])
         with torch.no_grad():
             scores = bagging.predict_scores(feats)
