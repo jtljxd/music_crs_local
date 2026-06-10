@@ -116,8 +116,12 @@ def run_inference(
     """
     遍历 Blind-A 每个 session，用 BaggingReranker 对召回候选排序，
     取 top-1 用 LLaMA 生成推荐理由，输出与官方格式一致的结果。
+    找不到 conv_emb 或召回候选的 session，用全局热门歌曲兜底，不跳过。
     """
     ds = load_dataset(dataset_name, split="test")
+
+    # 全局兜底候选：FeatureStore 里所有 track，按热门度排序取前 topk
+    fallback_tids: List[str] = list(feat_store.track_data.keys())[:topk]
 
     # 收集所有需要推理的样本
     pending = []
@@ -129,6 +133,17 @@ def run_inference(
         # Blind-A：找最后一个 user turn
         user_turns = [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
         if not user_turns:
+            # 完全没有 user turn，用兜底
+            pending.append({
+                "session_id":   session_id,
+                "user_id":      user_id,
+                "target_turn":  1,
+                "user_query":   "",
+                "conversations":convs,
+                "emb_key":      None,
+                "cands":        fallback_tids,
+                "fallback":     True,
+            })
             continue
         target_turn = max(user_turns)
         user_query  = next(
@@ -137,32 +152,37 @@ def run_inference(
             ""
         )
 
-        # 对话 embedding：找该 session 在 store 里 turn 最大的 key
-        # blind-A 的 emb 是按音乐推荐轮次存的，target_turn 本身（user turn）可能不在 store 里
+        # 对话 embedding：往前找最近可用的 key
         emb_key = None
         for t in range(target_turn, -1, -1):
             k = f"{session_id}_{t}"
             if k in conv_emb_store:
                 emb_key = k
                 break
-        if emb_key is None:
-            logger.warning("No conv_emb for %s (turn %d), skipping.", session_id, target_turn)
-            continue
 
-        # 召回候选
-        raw = (retrieval_store.get(emb_key)
-               or retrieval_store.get(f"{session_id}_{target_turn}"))
-        if raw is None:
-            logger.warning("No retrieval for %s turn %d, skipping.", session_id, target_turn)
-            continue
-        if isinstance(raw, dict):
-            cands: List[str] = list(raw.get("union", []))
-        elif isinstance(raw, list):
-            cands = list(raw)
-        else:
-            cands = []
+        # 召回候选：先精确匹配 emb_key，找不到则往前扫描最近有召回的 key
+        cands: List[str] = []
+        if emb_key is not None:
+            # 先试精确匹配
+            raw = (retrieval_store.get(emb_key)
+                   or retrieval_store.get(f"{session_id}_{target_turn}"))
+            # 找不到则往前找最近有召回的 key
+            if raw is None:
+                for t in range(target_turn, -1, -1):
+                    k = f"{session_id}_{t}"
+                    if k in retrieval_store:
+                        raw = retrieval_store[k]
+                        logger.debug("Retrieval fallback: %s → %s", emb_key, k)
+                        break
+            if raw is not None:
+                if isinstance(raw, dict):
+                    cands = list(raw.get("union", []))
+                elif isinstance(raw, list):
+                    cands = list(raw)
+
         if not cands:
-            continue
+            logger.warning("Fallback for %s (turn %d): no emb/retrieval.", session_id, target_turn)
+            cands = fallback_tids
 
         pending.append({
             "session_id":   session_id,
@@ -172,9 +192,11 @@ def run_inference(
             "conversations":convs,
             "emb_key":      emb_key,
             "cands":        cands,
+            "fallback":     not bool(emb_key and cands != fallback_tids),
         })
 
-    logger.info("Total sessions to infer: %d", len(pending))
+    logger.info("Total sessions to infer: %d (fallback: %d)",
+                len(pending), sum(1 for p in pending if p.get("fallback")))
 
     # ── Step 1: BaggingReranker 打分（批量）──────────────────────────────────
     name_map = {"fm": "FM", "dcn": "DCN", "xdfm": "xDeepFM",
@@ -186,6 +208,16 @@ def run_inference(
     for p in tqdm(pending, desc="Reranking"):
         emb_key = p["emb_key"]
         cands   = p["cands"]
+
+        # fallback session：没有 conv_emb，直接用召回顺序作为排名（不打分）
+        if emb_key is None:
+            top_tids = cands[:topk]
+            ranked_results.append((
+                p["session_id"], p["user_id"], p["target_turn"],
+                p["user_query"], p["conversations"], top_tids
+            ))
+            continue
+
         conv_emb = conv_emb_store[emb_key].float()
         if conv_emb.shape[0] > CONV_EMB_DIM:
             conv_emb = conv_emb[:CONV_EMB_DIM]
