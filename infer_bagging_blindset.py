@@ -263,16 +263,11 @@ def run_inference(
                 else "No track found."
             )
 
-        # 批量生成
-        if hasattr(lm, "batch_response_generation"):
-            responses = lm.batch_response_generation(
-                sys_prompts, chat_histories, recommend_strs
-            )
-        else:
-            responses = [
-                lm.response_generation(sp, ch, ri)
-                for sp, ch, ri in zip(sys_prompts, chat_histories, recommend_strs)
-            ]
+        # 逐条生成，避免 OOM
+        responses = []
+        for sp, ch, ri in zip(sys_prompts, chat_histories, recommend_strs):
+            resp = lm.response_generation(sp, ch, ri)
+            responses.append(resp)
 
         for j, (sid, uid, turn, query, convs, top_tids) in enumerate(chunk):
             results.append({
