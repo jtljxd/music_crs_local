@@ -80,7 +80,24 @@ def get_system_prompt(user_id, user_db: UserProfileDB, prompts_dir: str) -> str:
 #  主推理逻辑
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_inference(
+def _pick_cands(raw, channel: str, topk: int) -> List[str]:
+    """从 raw 召回结果里按 channel 策略取 topk 条候选。"""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw[:topk]
+    # dict 格式
+    if channel == "merged":
+        c1 = list(raw.get("ch1", []))
+        c3 = list(raw.get("ch3", []))
+        c5 = list(raw.get("ch5", []))
+        # 各取 top-K 去重合并，保序
+        merged = list(dict.fromkeys(c1[:topk] + c3[:topk] + c5[:topk]))
+        return merged[:topk]
+    else:
+        return list(raw.get(channel, []))[:topk]
+
+
     dataset_name: str,
     conv_emb_store: dict,
     retrieval_store: dict,
@@ -110,26 +127,35 @@ def run_inference(
             ""
         )
 
-        # 找召回：优先取最近可用的 key
-        raw = None
-        for t in range(target_turn, -1, -1):
-            k = f"{session_id}_{t}"
-            if k in retrieval_store:
-                raw = retrieval_store[k]
-                break
-
-        # 取 ch3 top-K
-        if raw is not None and isinstance(raw, dict):
-            ch3_cands = list(raw.get("ch3", []))
-        elif raw is not None and isinstance(raw, list):
-            # 旧格式无法区分 channel，整体作为候选
-            ch3_cands = list(raw)
+        # 找该 session 在 retrieval_store 里的最大 turn（即最后一轮召回）
+        session_keys = [k for k in retrieval_store if k.startswith(f"{session_id}_")]
+        if session_keys:
+            # 取 turn 编号最大的 key
+            def _turn(k): 
+                try: return int(k.split("_")[-1])
+                except: return -1
+            last_retr_key = max(session_keys, key=_turn)
+            raw = retrieval_store[last_retr_key]
         else:
-            ch3_cands = []
-            n_fallback += 1
-            logger.warning("No retrieval for session %s (turn %d), skip.", session_id, target_turn)
+            raw = None
 
-        top_tids = ch3_cands[:topk]
+        # 同时：conv_emb 也用 retrieval 同一 turn 的 key（保持一致）
+        emb_key = last_retr_key if session_keys else None
+        # 找最近可用的 conv_emb key（往前扫）
+        if emb_key not in conv_emb_store:
+            emb_key = None
+            t_max = _turn(last_retr_key) if session_keys else target_turn
+            for t in range(t_max, -1, -1):
+                k = f"{session_id}_{t}"
+                if k in conv_emb_store:
+                    emb_key = k
+                    break
+
+        # 取指定 channel 的 top-K 候选
+        top_tids = _pick_cands(raw, channel, topk)
+        if not top_tids:
+            n_fallback += 1
+            logger.warning("No retrieval for session %s, will output empty track list.", session_id)
 
         pending.append({
             "session_id":   session_id,
@@ -225,6 +251,7 @@ def main(args):
         item_db         = item_db,
         user_db         = user_db,
         prompts_dir     = prompts_dir,
+        channel         = args.channel,
         topk            = args.topk,
         batch_size      = args.batch_size,
     )
@@ -247,11 +274,14 @@ if __name__ == "__main__":
                    help="Blind-A 对话 embedding .pt")
     p.add_argument("--retrieval",  type=str, required=True,
                    help="Blind-A 召回候选 .pt（含 ch3 字段）")
+    p.add_argument("--channel",   type=str, default="ch3",
+                   choices=["ch1", "ch3", "ch5", "merged"],
+                   help="召回 channel: ch1/ch3/ch5/merged(三路各取top-K去重合并)")
     p.add_argument("--topk",       type=int, default=20)
     p.add_argument("--batch_size", type=int, default=4,
                    help="LLM 生成 batch size")
     p.add_argument("--out",        type=str,
-                   default="exp/inference/blindset_A/ch3_direct_top20.json")
+                   default="exp/inference/blindset_A/direct_top20.json")
     p.add_argument("--device",     type=str, default=None)
     args = p.parse_args()
     main(args)
