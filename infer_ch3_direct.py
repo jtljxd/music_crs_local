@@ -110,18 +110,40 @@ def run_inference(
     topk: int = 20,
     batch_size: int = 8,
 ):
+    """
+    遍历 Blind-A 数据集，每个 session 只处理最后一个 user query。
+    召回候选从 retrieval_store 里该 session 最大 turn 的 key 取。
+    """
     ds = load_dataset(dataset_name, split="test")
+
+    def _turn_num(k):
+        try: return int(k.rsplit("_", 1)[-1])
+        except: return -1
+
+    # 按 session 分组 retrieval_store 的 key，找每个 session 的最大 turn
+    from collections import defaultdict
+    sess_turns: dict = defaultdict(list)
+    for k in retrieval_store:
+        parts = k.rsplit("_", 1)
+        if len(parts) == 2:
+            sess_turns[parts[0]].append(int(parts[1]))
+    # session_id → 最大 turn 的 retrieval key
+    sess_last_key = {
+        sid: f"{sid}_{max(turns)}"
+        for sid, turns in sess_turns.items()
+    }
+    logger.info("Sessions with retrieval: %d", len(sess_last_key))
 
     pending = []
     n_fallback = 0
 
     for item in tqdm(ds, desc="Collecting sessions", unit="session"):
-        session_id = item["session_id"]
-        user_id    = item.get("user_id")
-        convs      = item["conversations"]
+        session_id  = item["session_id"]
+        user_id     = item.get("user_id")
+        convs       = item["conversations"]
 
-        # 最后一个 user turn
-        user_turns = [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
+        # 最后一个 user turn（query）
+        user_turns  = [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
         target_turn = max(user_turns) if user_turns else 1
         user_query  = next(
             (c["content"] for c in convs
@@ -129,43 +151,30 @@ def run_inference(
             ""
         )
 
-        # 找该 session 在 retrieval_store 里的最大 turn（即最后一轮召回）
-        session_keys = [k for k in retrieval_store if k.startswith(f"{session_id}_")]
-        if session_keys:
-            # 取 turn 编号最大的 key
-            def _turn(k): 
-                try: return int(k.split("_")[-1])
-                except: return -1
-            last_retr_key = max(session_keys, key=_turn)
-            raw = retrieval_store[last_retr_key]
-        else:
-            raw = None
-
-        # 同时：conv_emb 也用 retrieval 同一 turn 的 key（保持一致）
-        emb_key = last_retr_key if session_keys else None
-        # 找最近可用的 conv_emb key（往前扫）
-        if emb_key not in conv_emb_store:
-            emb_key = None
-            t_max = _turn(last_retr_key) if session_keys else target_turn
-            for t in range(t_max, -1, -1):
-                k = f"{session_id}_{t}"
-                if k in conv_emb_store:
-                    emb_key = k
-                    break
-
-        # 取指定 channel 的 top-K 候选
+        # 取该 session 最后一轮的召回
+        retr_key = sess_last_key.get(session_id)
+        raw      = retrieval_store.get(retr_key) if retr_key else None
         top_tids = _pick_cands(raw, channel, topk)
+
         if not top_tids:
             n_fallback += 1
-            logger.warning("No retrieval for session %s, will output empty track list.", session_id)
+            logger.warning("No retrieval for session %s, empty output.", session_id)
+
+        # conv_emb：往前扫找最近可用的 key
+        emb_key = None
+        for t in range(target_turn, -1, -1):
+            k = f"{session_id}_{t}"
+            if k in conv_emb_store:
+                emb_key = k
+                break
 
         pending.append({
-            "session_id":   session_id,
-            "user_id":      user_id,
-            "target_turn":  target_turn,
-            "user_query":   user_query,
-            "conversations":convs,
-            "top_tids":     top_tids,
+            "session_id":    session_id,
+            "user_id":       user_id,
+            "target_turn":   target_turn,
+            "user_query":    user_query,
+            "conversations": convs,
+            "top_tids":      top_tids,
         })
 
     logger.info("Sessions: %d  (no retrieval: %d)", len(pending), n_fallback)
@@ -207,8 +216,10 @@ def run_inference(
 
 def main(args):
     config       = OmegaConf.load(args.config)
-    dataset_name = config.get("test_dataset_name",
-                               "talkpl-ai/TalkPlayData-Challenge-Blind-A")
+    # Blind-A 数据集名（优先 blind_dataset_name，fallback blindA）
+    dataset_name = (config.get("blind_dataset_name")
+                    or config.get("blindA_dataset_name")
+                    or "talkpl-ai/TalkPlayData-Challenge-Blind-A")
     logger.info("Dataset: %s", dataset_name)
 
     track_meta_db = config.get("item_db_name",
