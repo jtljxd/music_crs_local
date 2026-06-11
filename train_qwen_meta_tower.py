@@ -597,7 +597,7 @@ def train(args):
     if blind_gt: eval_sets["blinda_non_last"] = blind_gt
     logger.info("Eval sets: %s", {k: len(v) for k, v in eval_sets.items()})
 
-    out_txt = os.path.join(ckpt_dir, "recall_by_epoch.txt")
+    out_txt = os.path.join(args.checkpoint_dir, "recall_by_epoch.txt")
     with open(out_txt, "w", encoding="utf-8") as f:
         f.write(f"ch3 QwenMeta Two-Tower — per-epoch recall\n")
         f.write(f"K_EVAL={K_EVAL}\n")
