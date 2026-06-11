@@ -268,8 +268,7 @@ def collate_batch(
 
 def run_phase(phase_name, samples, model, optimizer,
               track_meta, all_tids, args, epochs, device, ckpt_dir,
-              val_samples=None, eval_sets=None, item_matrix=None,
-              item_ids=None, out_txt=None):
+              val_samples=None, eval_sets=None, out_txt=None):
     loss_fn    = nn.BCEWithLogitsLoss(reduction="none")
     patience   = args.early_stop_patience
     min_delta  = args.early_stop_min_delta
@@ -339,7 +338,7 @@ def run_phase(phase_name, samples, model, optimizer,
                    os.path.join(ckpt_dir, f"model_{phase_name}_epoch{epoch}.pt"))
 
         # ── Per-epoch recall eval ──
-        if eval_sets and item_matrix is not None and out_txt:
+        if eval_sets and out_txt:
             # 每 epoch 重新 encode item（因为 model 参数在变）
             cur_mat, cur_ids = build_item_matrix(model, track_meta, device)
             eval_recall_ch3(model, cur_mat, cur_ids, eval_sets, device,
@@ -614,8 +613,6 @@ def train(args):
               track_meta, all_tids, args, args.train_epochs, device, ckpt_dir_,
               val_samples=val_samples,
               eval_sets=eval_sets,
-              item_matrix=None,   # built inside each epoch
-              item_ids=None,
               out_txt=out_txt)
 
     # Save final model
