@@ -105,6 +105,7 @@ def _pick_cands(raw, channel: str, topk: int) -> List[str]:
     item_db,
     user_db,
     prompts_dir: str,
+    channel: str = "ch3",
     topk: int = 20,
     batch_size: int = 8,
 ):
