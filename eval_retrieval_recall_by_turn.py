@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-K_LIST        = [20, 50, 100, 200, 300, 400, 500]
+K_LIST        = [20, 50, 100, 200, 300]
 CHANNELS      = ["ch1", "ch3", "ch5"]
 # merged@K = ch1[:K] ∪ ch3[:K] ∪ ch5[:K] 去重，最多 3K 条
 # 用于公平对比"各路各取 top-K 合并后"的召回上限

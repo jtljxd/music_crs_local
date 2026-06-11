@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-K_LIST = [20, 50, 100, 200, 300, 400, 500]
+K_LIST = [20, 50, 100, 200, 300]
 CHANNELS = ["ch1", "ch3", "ch5", "union"]
 
 
