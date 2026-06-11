@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 K_LIST        = [20, 50, 100, 200, 300, 400, 500]
-CHANNELS      = ["ch1", "ch3", "ch5", "union"]
+CHANNELS      = ["ch1", "ch3", "ch5"]
 # merged@K = ch1[:K] ∪ ch3[:K] ∪ ch5[:K] 去重，最多 3K 条
 # 用于公平对比"各路各取 top-K 合并后"的召回上限
 MERGED_K_LIST = [20, 50, 100, 200, 300]
@@ -65,14 +65,13 @@ def parse_ch_cands(raw) -> dict:
     """把 retrieval_store 里的原始值统一转成 {ch: [track_id, ...]} 格式。"""
     if isinstance(raw, dict):
         return {
-            "ch1":   list(raw.get("ch1",   [])),
-            "ch3":   list(raw.get("ch3",   [])),
-            "ch5":   list(raw.get("ch5",   [])),
-            "union": list(raw.get("union", [])),
+            "ch1": list(raw.get("ch1", [])),
+            "ch3": list(raw.get("ch3", [])),
+            "ch5": list(raw.get("ch5", [])),
         }
     elif isinstance(raw, list):
-        return {"ch1": [], "ch3": [], "ch5": [], "union": list(raw)}
-    return {"ch1": [], "ch3": [], "ch5": [], "union": []}
+        return {"ch1": [], "ch3": [], "ch5": []}
+    return {"ch1": [], "ch3": [], "ch5": []}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,14 +235,13 @@ def format_table(result: dict, title: str) -> str:
         n    = meta["total_all"].get(ch, 0)
         lines.append(f"  {ch:<14}  {vals}   (n={n})")
 
-    # merged 行：各路各取 top-K 去重后的联合召回
+    # merged 汇总行
     merged_hdr = "  ".join(f"@{k:<{col_w-2}}" for k in MERGED_K_LIST)
-    lines.append("")
-    lines.append(f"  {'merged(去重)':<14}  {merged_hdr}   (ch1[:K]∪ch3[:K]∪ch5[:K], 最多3K条)")
-    lines.append("  " + "-" * (12 + (col_w + 2) * len(MERGED_K_LIST)))
-    mrow = result["merged_all"]
+    lines.append("  " + "-" * (len(sep) - 2))
+    lines.append(f"  {'merged':<14}  {merged_hdr}   ← ch1[:K]∪ch3[:K]∪ch5[:K] 去重，最多3K条")
+    mrow  = result["merged_all"]
     mvals = "  ".join(f"{mrow[k]*100:>{col_w-1}.2f}%" for k in MERGED_K_LIST)
-    lines.append(f"  {'merged':<14}  {mvals}   (n={meta['total_merged']})")
+    lines.append(f"  {'':14}  {mvals}   (n={meta['total_merged']})")
     lines.append("")
 
     # by turn
