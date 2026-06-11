@@ -278,11 +278,21 @@ def main(args):
         convs=item["conversations"]
         music_turns={int(c["turn_number"]):c["content"] for c in convs if c.get("role")=="music" and c.get("content")}
 
-        # blind-A 没有 music turn，对所有 user turn 都做召回（conv_emb 每轮都有）
+        # Blind-A：music turn 有 GT（历史推荐），同时也要对最后一个 user turn 做召回（待预测）
+        # 所有 music turn + 最后一个 user turn 都需要生成召回
         if not music_turns:
-            user_turns=[int(c["turn_number"]) for c in convs if c.get("role")=="user"]
-            if not user_turns: continue
-            music_turns={t: None for t in user_turns}  # 每轮都做，用 None 占位
+            # 纯单轮 session（没有任何历史推荐）
+            user_turns_list=[int(c["turn_number"]) for c in convs if c.get("role")=="user"]
+            if not user_turns_list: continue
+            music_turns={max(user_turns_list): None}
+        else:
+            # 追加最后一个 user turn（无 music GT，用 None 占位）
+            user_turns_list=[int(c["turn_number"]) for c in convs if c.get("role")=="user"]
+            if user_turns_list:
+                last_user=max(user_turns_list)
+                if last_user not in music_turns:
+                    music_turns=dict(music_turns)  # 复制避免修改原数据
+                    music_turns[last_user]=None
 
         for turn_num,_ in music_turns.items():
             emb_key=f"{session_id}_{turn_num}"
