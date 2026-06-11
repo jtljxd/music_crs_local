@@ -1,0 +1,257 @@
+"""
+infer_ch3_direct.py
+────────────────────
+直接用 ch3_QwenMeta 召回的 top-20 作为 predicted_track_ids，
+跳过精排模型，过 LLaMA 生成推荐理由，输出 Blind-A 评测格式。
+
+用法（服务器）:
+    nohup python infer_ch3_direct.py \
+        --config    config/llama1b_multi_channel_devset.yaml \
+        --conv_emb  qwen/hist_conversation_embeddings_blinda_0.6b.pt \
+        --retrieval qwen/retrieval_blinda_candidates.pt \
+        --topk      20 \
+        --out       exp/inference/blindset_A/ch3_direct_top20.json \
+        > logs/infer_ch3_direct.log 2>&1 &
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+
+import torch
+from datasets import load_dataset
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+# 复用已有模块
+sys.path.insert(0, os.path.dirname(__file__))
+from mcrs.lm_modules.llm import load_lm_module
+from mcrs.database import MusicCatalogDB, UserProfileDB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  复用 infer_bagging_blindset.py 的工具函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_chat_history(conversations, item_db, target_turn: int):
+    """把 session 对话历史转成 LLM chat 格式（不含最后一条 user query）。"""
+    history = []
+    for conv in sorted(conversations, key=lambda c: int(c["turn_number"])):
+        turn = int(conv["turn_number"])
+        if turn >= target_turn:
+            break
+        role    = conv.get("role", "")
+        content = str(conv.get("content", "") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            history.append({"role": "user", "content": content})
+        elif role in ("assistant", "music"):
+            track_id = content
+            meta_str = item_db.id_to_metadata(track_id) if track_id else content
+            history.append({"role": "assistant", "content": meta_str})
+    return history
+
+
+def get_system_prompt(user_id, user_db, prompts_dir: str) -> str:
+    try:
+        profile = user_db.get_profile(user_id)
+    except Exception:
+        profile = {}
+    base_path = os.path.join(prompts_dir, "base_prompt.txt")
+    try:
+        with open(base_path, "r", encoding="utf-8") as f:
+            template = f.read()
+        return template.format(**profile) if profile else template
+    except Exception:
+        return "You are a helpful music recommendation assistant."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  主推理逻辑
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_inference(
+    dataset_name: str,
+    conv_emb_store: dict,
+    retrieval_store: dict,
+    lm,
+    item_db,
+    user_db,
+    prompts_dir: str,
+    topk: int = 20,
+    batch_size: int = 8,
+):
+    ds = load_dataset(dataset_name, split="test")
+
+    pending = []
+    n_fallback = 0
+
+    for item in tqdm(ds, desc="Collecting sessions", unit="session"):
+        session_id = item["session_id"]
+        user_id    = item.get("user_id")
+        convs      = item["conversations"]
+
+        # 最后一个 user turn
+        user_turns = [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
+        target_turn = max(user_turns) if user_turns else 1
+        user_query  = next(
+            (c["content"] for c in convs
+             if int(c["turn_number"]) == target_turn and c.get("role") == "user"),
+            ""
+        )
+
+        # 找召回：优先取最近可用的 key
+        raw = None
+        for t in range(target_turn, -1, -1):
+            k = f"{session_id}_{t}"
+            if k in retrieval_store:
+                raw = retrieval_store[k]
+                break
+
+        # 取 ch3 top-K
+        if raw is not None and isinstance(raw, dict):
+            ch3_cands = list(raw.get("ch3", []))
+        elif raw is not None and isinstance(raw, list):
+            # 旧格式无法区分 channel，整体作为候选
+            ch3_cands = list(raw)
+        else:
+            ch3_cands = []
+            n_fallback += 1
+            logger.warning("No retrieval for session %s (turn %d), skip.", session_id, target_turn)
+
+        top_tids = ch3_cands[:topk]
+
+        pending.append({
+            "session_id":   session_id,
+            "user_id":      user_id,
+            "target_turn":  target_turn,
+            "user_query":   user_query,
+            "conversations":convs,
+            "top_tids":     top_tids,
+        })
+
+    logger.info("Sessions: %d  (no retrieval: %d)", len(pending), n_fallback)
+
+    # ── LLaMA 生成推荐理由 ────────────────────────────────────────────────────
+    logger.info("Generating LLM responses (topk=%d, batch_size=%d) ...", topk, batch_size)
+    results = []
+
+    for i in tqdm(range(0, len(pending), batch_size), desc="LLM generation"):
+        chunk = pending[i: i + batch_size]
+        for p in chunk:
+            top_tids    = p["top_tids"]
+            recommend_tid = top_tids[0] if top_tids else None
+
+            history = build_chat_history(p["conversations"], item_db, p["target_turn"])
+            history.append({"role": "user", "content": p["user_query"]})
+            sys_prompt   = get_system_prompt(p["user_id"], user_db, prompts_dir)
+            recommend_str = (
+                item_db.id_to_metadata(recommend_tid) if recommend_tid
+                else "No track found."
+            )
+
+            resp = lm.response_generation(sys_prompt, history, recommend_str)
+
+            results.append({
+                "session_id":          p["session_id"],
+                "user_id":             p["user_id"],
+                "turn_number":         p["target_turn"],
+                "predicted_track_ids": top_tids,
+                "predicted_response":  resp,
+            })
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main(args):
+    config       = OmegaConf.load(args.config)
+    dataset_name = config.get("test_dataset_name",
+                               "talkpl-ai/TalkPlayData-Challenge-Blind-A")
+    logger.info("Dataset: %s", dataset_name)
+
+    track_meta_db = config.get("item_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
+    user_meta_db  = config.get("user_db_name",
+                                "talkpl-ai/TalkPlayData-Challenge-User-Metadata")
+    split_types   = list(config.get("track_split_types",   ["all_tracks"]))
+    user_splits   = list(config.get("user_split_types",    ["all_users"]))
+    corpus_types  = list(config.get("corpus_types",
+                                     ["track_name", "artist_name", "album_name"]))
+    device        = args.device or config.get("device", "cuda")
+
+    # ── 对话 embedding（仅用于 fallback 日志，ch3 召回已预存）────────────────
+    logger.info("Loading conv embeddings from %s ...", args.conv_emb)
+    conv_emb_store = torch.load(args.conv_emb, map_location="cpu", weights_only=True)
+    logger.info("  %d entries.", len(conv_emb_store))
+
+    # ── 召回候选 ─────────────────────────────────────────────────────────────
+    logger.info("Loading retrieval candidates from %s ...", args.retrieval)
+    retrieval_store = torch.load(args.retrieval, map_location="cpu", weights_only=False)
+    logger.info("  %d entries.", len(retrieval_store))
+
+    # ── LLM + DB ─────────────────────────────────────────────────────────────
+    lm_type = config.get("lm_type", "meta-llama/Llama-3.2-1B-Instruct")
+    logger.info("Loading LLM: %s ...", lm_type)
+    lm = load_lm_module(
+        lm_type,
+        device,
+        config.get("attn_implementation", "eager"),
+        torch.bfloat16,
+    )
+    item_db     = MusicCatalogDB(track_meta_db, split_types, corpus_types)
+    user_db     = UserProfileDB(user_meta_db, user_splits)
+    prompts_dir = os.path.join(os.path.dirname(__file__), "mcrs", "system_prompts")
+
+    # ── 推理 ─────────────────────────────────────────────────────────────────
+    results = run_inference(
+        dataset_name    = dataset_name,
+        conv_emb_store  = conv_emb_store,
+        retrieval_store = retrieval_store,
+        lm              = lm,
+        item_db         = item_db,
+        user_db         = user_db,
+        prompts_dir     = prompts_dir,
+        topk            = args.topk,
+        batch_size      = args.batch_size,
+    )
+    logger.info("Done. %d sessions.", len(results))
+
+    # ── 保存 ─────────────────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    logger.info("Results saved to %s", args.out)
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(
+        description="ch3 top-K direct → LLaMA → Blind-A submission"
+    )
+    p.add_argument("--config",     type=str,
+                   default="config/llama1b_multi_channel_devset.yaml")
+    p.add_argument("--conv_emb",   type=str, required=True,
+                   help="Blind-A 对话 embedding .pt")
+    p.add_argument("--retrieval",  type=str, required=True,
+                   help="Blind-A 召回候选 .pt（含 ch3 字段）")
+    p.add_argument("--topk",       type=int, default=20)
+    p.add_argument("--batch_size", type=int, default=4,
+                   help="LLM 生成 batch size")
+    p.add_argument("--out",        type=str,
+                   default="exp/inference/blindset_A/ch3_direct_top20.json")
+    p.add_argument("--device",     type=str, default=None)
+    args = p.parse_args()
+    main(args)
