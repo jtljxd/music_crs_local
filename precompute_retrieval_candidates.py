@@ -278,12 +278,11 @@ def main(args):
         convs=item["conversations"]
         music_turns={int(c["turn_number"]):c["content"] for c in convs if c.get("role")=="music" and c.get("content")}
 
-        # blind-A 没有 music turn，改为用最后一个 user turn 作为目标
+        # blind-A 没有 music turn，对所有 user turn 都做召回（conv_emb 每轮都有）
         if not music_turns:
             user_turns=[int(c["turn_number"]) for c in convs if c.get("role")=="user"]
             if not user_turns: continue
-            target_turn=max(user_turns)
-            music_turns={target_turn: None}  # 用 None 占位，只做召回
+            music_turns={t: None for t in user_turns}  # 每轮都做，用 None 占位
 
         for turn_num,_ in music_turns.items():
             emb_key=f"{session_id}_{turn_num}"
