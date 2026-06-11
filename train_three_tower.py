@@ -456,14 +456,12 @@ def build_training_samples(
     logger.info("Loading '%s' split='%s' …", dataset_name, split)
     ds = load_dataset(dataset_name, split=split)
     samples: List[Dict] = []
-    label_dist = {"1.0_strong": 0, "1.0_weak": 0, "skipped": 0}
+    skipped = 0
 
     for item in tqdm(ds, desc=f"Building samples [{split}]", unit="session"):
         session_id  = item["session_id"]
         user_id     = item.get("user_id", None)
         convs       = item["conversations"]
-        assessments = item.get("goal_progress_assessments", [])
-        asmt_map = {int(a["turn_number"]): a.get("goal_progress_assessment") for a in assessments}
 
         music_turns: Dict[int, str] = {}
         for c in convs:
@@ -471,23 +469,9 @@ def build_training_samples(
                 music_turns[int(c["turn_number"])] = c["content"]
 
         for turn_number, track_id in music_turns.items():
-            feedback_turn = turn_number + 1
-            if feedback_turn not in asmt_map:
-                label_dist["skipped"] += 1; continue
-
-            gpa = asmt_map[feedback_turn]
-            if gpa == "MOVES_TOWARD_GOAL":
-                label, weight = 1.0, WEIGHT_MOVES
-                label_dist["1.0_strong"] += 1
-            elif gpa == "DOES_NOT_MOVE_TOWARD_GOAL":
-                label, weight = 1.0, WEIGHT_NO_MOVE   # 正样本，权重低
-                label_dist["1.0_weak"] += 1
-            else:
-                label_dist["skipped"] += 1; continue
-
             emb_key = f"{session_id}_{turn_number}"
             if emb_key not in conv_emb_store:
-                label_dist["skipped"] += 1; continue
+                skipped += 1; continue
 
             conv_emb = conv_emb_store[emb_key].float()
             if conv_emb.shape[0] > CONV_EMB_DIM:
@@ -499,14 +483,12 @@ def build_training_samples(
                 "session_id": session_id,
                 "user_id":    user_id,
                 "track_id":   track_id,
-                "label":      label,
-                "weight":     weight,
+                "label":      1.0,
+                "weight":     1.0,
                 "conv_emb":   conv_emb,
             })
 
-    logger.info("Built %d samples | strong_pos=%d  weak_pos=%d  skipped=%d",
-                len(samples), label_dist["1.0_strong"], label_dist["1.0_weak"],
-                label_dist["skipped"])
+    logger.info("Built %d samples  (skipped_no_emb=%d)", len(samples), skipped)
     return samples
 
 
@@ -597,7 +579,8 @@ def collate_batch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_phase(phase_name, samples, model, optimizer,
-              track_data, user_data, all_tids, args, epochs, device, ckpt_dir):
+              track_data, user_data, all_tids, args, epochs, device, ckpt_dir,
+              val_samples=None, eval_sets=None, out_txt=None):
     loss_fn    = nn.BCEWithLogitsLoss(reduction="none")
     patience   = args.early_stop_patience
     min_delta  = args.early_stop_min_delta
@@ -605,8 +588,10 @@ def run_phase(phase_name, samples, model, optimizer,
     no_improve = 0
     best_ckpt  = os.path.join(ckpt_dir, f"model_{phase_name}_best.pt")
 
-    logger.info("[%s] %d samples, max_epochs=%d, batch=%d, patience=%d",
-                phase_name, len(samples), epochs, args.batch_size, patience)
+    use_val = val_samples is not None and len(val_samples) > 0
+    logger.info("[%s] train=%d  val=%d  max_epochs=%d  batch=%d  patience=%d",
+                phase_name, len(samples), len(val_samples) if use_val else 0,
+                epochs, args.batch_size, patience)
     global_step = 0
     for epoch in range(1, epochs + 1):
         random.shuffle(samples)
@@ -630,17 +615,43 @@ def run_phase(phase_name, samples, model, optimizer,
             if global_step % args.save_every == 0:
                 torch.save({"model_state_dict": model.state_dict()},
                            os.path.join(ckpt_dir, "model_latest.pt"))
-        avg = ep_loss / max(ep_steps, 1)
-        logger.info("[%s] Epoch %d avg_loss=%.4f", phase_name, epoch, avg)
+        train_avg = ep_loss / max(ep_steps, 1)
+
+        # ── Val loss ──
+        if use_val:
+            model.eval()
+            val_loss, val_steps = 0.0, 0
+            with torch.no_grad():
+                for start in range(0, len(val_samples), args.batch_size):
+                    batch = val_samples[start: start + args.batch_size]
+                    if not batch: continue
+                    inputs, label_t, weight_t = collate_batch(
+                        batch, all_tids, track_data, user_data, device)
+                    scores = model(**inputs)
+                    loss   = (loss_fn(scores, label_t) * weight_t).mean()
+                    val_loss += loss.item(); val_steps += 1
+            monitor_loss = val_loss / max(val_steps, 1)
+            logger.info("[%s] Epoch %d  train_loss=%.4f  val_loss=%.4f",
+                        phase_name, epoch, train_avg, monitor_loss)
+        else:
+            monitor_loss = train_avg
+            logger.info("[%s] Epoch %d  train_loss=%.4f", phase_name, epoch, train_avg)
+
         torch.save({"model_state_dict": model.state_dict()},
                    os.path.join(ckpt_dir, f"model_{phase_name}_epoch{epoch}.pt"))
 
-        # ── Early stopping ──
-        if avg < best_loss - min_delta:
-            best_loss  = avg
+        # ── Per-epoch recall eval ──
+        if eval_sets and out_txt:
+            cur_mat, cur_ids = build_item_matrix_ch1(model, track_data, device)
+            eval_recall_ch1(model, cur_mat, cur_ids, eval_sets, device,
+                            out_txt, epoch, phase_name)
+
+        # ── Early stopping on monitor_loss ──
+        if monitor_loss < best_loss - min_delta:
+            best_loss  = monitor_loss
             no_improve = 0
             torch.save({"model_state_dict": model.state_dict()}, best_ckpt)
-            logger.info("[%s] ★ New best loss=%.4f, saved to %s",
+            logger.info("[%s] ★ New best val_loss=%.4f → %s",
                         phase_name, best_loss, best_ckpt)
         else:
             no_improve += 1
@@ -650,13 +661,143 @@ def run_phase(phase_name, samples, model, optimizer,
                 logger.info("[%s] Early stopping at epoch %d.", phase_name, epoch)
                 break
 
-    # 训练结束后恢复最优权重
+    # 应用最优权重
     if os.path.exists(best_ckpt):
         logger.info("[%s] Restoring best model from %s", phase_name, best_ckpt)
         ckpt = torch.load(best_ckpt, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
 
     return best_loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-epoch recall evaluation helper  (ch1 three-tower)
+# ─────────────────────────────────────────────────────────────────────────────
+
+K_EVAL = [20, 50, 100, 200]
+
+def _build_eval_gt_ch1(
+    ds_iter,
+    conv_emb_store: Dict[str, torch.Tensor],
+    user_data: Dict,
+    max_sessions: int = 100,
+    non_last_only: bool = False,
+) -> List[Dict]:
+    records = []
+    n_sess  = 0
+    for item in ds_iter:
+        if n_sess >= max_sessions:
+            break
+        convs   = item["conversations"]
+        sid     = item["session_id"]
+        uid     = item.get("user_id")
+        music_turns = {int(c["turn_number"]): c["content"]
+                       for c in convs if c.get("role") == "music" and c.get("content")}
+        if not music_turns:
+            continue
+        user_turns = [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
+        last_user  = max(user_turns) if user_turns else 0
+        pairs = ([(t, gt) for t, gt in music_turns.items() if t < last_user]
+                 if non_last_only else [(max(music_turns.keys()), music_turns[max(music_turns.keys())])])
+        for t, gt in pairs:
+            key = f"{sid}_{t}"
+            if key not in conv_emb_store:
+                for tt in range(t - 1, -1, -1):
+                    k2 = f"{sid}_{tt}"
+                    if k2 in conv_emb_store:
+                        key = k2; break
+                else:
+                    continue
+            emb = conv_emb_store[key].float()
+            if emb.shape[0] > CONV_EMB_DIM:
+                emb = emb[:CONV_EMB_DIM]
+            elif emb.shape[0] < CONV_EMB_DIM:
+                emb = F.pad(emb, (0, CONV_EMB_DIM - emb.shape[0]))
+            u = user_data.get(uid, {}) if uid else {}
+            records.append({
+                "conv_emb":    emb,
+                "gt_tid":      gt,
+                "cf_user":     u.get("cf-bpr",     torch.zeros(CF_BPR_DIM)).float(),
+                "age_idx":     u.get("age_idx",    0),
+                "gender_idx":  u.get("gender_idx", 0),
+                "country_idx": u.get("country_idx",0),
+            })
+        n_sess += 1
+    return records
+
+
+@torch.no_grad()
+def build_item_matrix_ch1(model: CFBPRThreeTower, track_data: Dict,
+                           device: str, bs: int = 512):
+    model.eval()
+    track_ids = sorted(track_data.keys())
+    vecs = []
+    for s in range(0, len(track_ids), bs):
+        b    = track_ids[s:s+bs]
+        cf   = torch.stack([track_data[t]["cf-bpr"]   for t in b]).to(device)
+        attr = torch.stack([track_data[t]["attr_emb"] for t in b]).to(device)
+        meta = torch.stack([track_data[t]["meta_emb"] for t in b]).to(device)
+        pop  = torch.tensor([track_data[t]["pop_bucket"]  for t in b], dtype=torch.long, device=device)
+        year = torch.tensor([track_data[t]["year_bucket"] for t in b], dtype=torch.long, device=device)
+        dur  = torch.tensor([track_data[t]["dur_bucket"]  for t in b], dtype=torch.long, device=device)
+        vecs.append(model.encode_item(cf, attr, meta, pop, year, dur).cpu())
+    return torch.cat(vecs, dim=0), track_ids
+
+
+@torch.no_grad()
+def eval_recall_ch1(
+    model:       CFBPRThreeTower,
+    item_matrix: torch.Tensor,
+    item_ids:    List[str],
+    eval_sets:   Dict[str, List[Dict]],
+    device:      str,
+    out_txt:     str,
+    epoch:       int,
+    phase:       str,
+) -> None:
+    import math
+    model.eval()
+    item_matrix = item_matrix.to(device)
+
+    lines = [f"\n=== Epoch {epoch} [{phase}] ==="]
+    for name, records in eval_sets.items():
+        if not records:
+            lines.append(f"  [{name}]  (empty)")
+            continue
+        hits   = {k: 0 for k in K_EVAL}
+        ndcg20 = 0.0
+        valid  = 0
+        id2idx = {tid: i for i, tid in enumerate(item_ids)}
+
+        for r in records:
+            gt  = r["gt_tid"]
+            if gt not in id2idx:
+                continue
+            valid += 1
+            cf   = r["cf_user"].unsqueeze(0).to(device)
+            age  = torch.tensor([r["age_idx"]],    dtype=torch.long,  device=device)
+            gen  = torch.tensor([r["gender_idx"]],  dtype=torch.long,  device=device)
+            cnt  = torch.tensor([r["country_idx"]], dtype=torch.long,  device=device)
+            conv = r["conv_emb"].unsqueeze(0).to(device)
+            fv   = model.encode_fusion(cf, age, gen, cnt, conv).squeeze(0)  # [128]
+            sc   = (item_matrix * fv.unsqueeze(0)).sum(1)
+            topK = torch.topk(sc, min(max(K_EVAL), sc.shape[0])).indices.tolist()
+            top_ids = [item_ids[j] for j in topK]
+            for k in K_EVAL:
+                if gt in top_ids[:k]:
+                    hits[k] += 1
+            if gt in top_ids[:20]:
+                rank = top_ids[:20].index(gt) + 1
+                ndcg20 += 1.0 / math.log2(rank + 1)
+
+        n = max(valid, 1)
+        r_str = "  ".join(f"R@{k}={hits[k]/n*100:.2f}%" for k in K_EVAL)
+        lines.append(f"  [{name}] n={valid}  {r_str}  NDCG@20={ndcg20/n:.4f}")
+
+    block = "\n".join(lines)
+    logger.info(block)
+    with open(out_txt, "a", encoding="utf-8") as f:
+        f.write(block + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -709,15 +850,17 @@ def train(args):
 
     logger.info("Loading train conv_emb from %s …", args.train_conv_emb)
     train_ce = torch.load(args.train_conv_emb, map_location="cpu", weights_only=True)
-    logger.info("  train: %d entries.", len(train_ce))
-    logger.info("Loading test conv_emb from %s …", args.test_conv_emb)
-    test_ce  = torch.load(args.test_conv_emb,  map_location="cpu", weights_only=True)
-    logger.info("  test:  %d entries.", len(test_ce))
+    logger.info("  %d entries.", len(train_ce))
 
-    train_samples = build_training_samples(dataset_name, "train", train_ce)
-    test_samples  = build_training_samples(dataset_name, "test",  test_ce)
-    if not train_samples:
+    all_samples = build_training_samples(dataset_name, "train", train_ce)
+    if not all_samples:
         logger.error("No training samples."); return
+
+    random.shuffle(all_samples)
+    val_size      = max(1, int(len(all_samples) * 0.2))
+    val_samples   = all_samples[:val_size]
+    train_samples = all_samples[val_size:]
+    logger.info("Train/Val split: %d / %d", len(train_samples), len(val_samples))
 
     logger.info("Loading track data …")
     track_data = load_track_data(track_emb_db, track_meta_db, split_types)
@@ -726,24 +869,58 @@ def train(args):
 
     all_tids = list(track_data.keys())
 
+    # ── Prepare per-epoch recall eval sets ────────────────────────────────────
+    blind_dataset = (config.get("blind_dataset_name")
+                     or "talkpl-ai/TalkPlayData-Challenge-Blind-A")
+    test_ce_path  = args.train_conv_emb.replace("train", "test")
+    blind_ce_path = args.train_conv_emb.replace("train", "blinda")
+
+    logger.info("Preparing eval GT sets …")
+    val_gt = [{"conv_emb": s["conv_emb"], "gt_tid": s["track_id"],
+               "cf_user": user_data.get(s.get("user_id"), {}).get("cf-bpr", torch.zeros(CF_BPR_DIM)).float(),
+               "age_idx": user_data.get(s.get("user_id"), {}).get("age_idx", 0),
+               "gender_idx": user_data.get(s.get("user_id"), {}).get("gender_idx", 0),
+               "country_idx": user_data.get(s.get("user_id"), {}).get("country_idx", 0)}
+              for s in val_samples[:100]]
+    test_gt  = []
+    blind_gt = []
+    if os.path.exists(test_ce_path):
+        test_ce = torch.load(test_ce_path, map_location="cpu", weights_only=True)
+        test_ds = load_dataset(dataset_name, split="test")
+        test_gt = _build_eval_gt_ch1(iter(test_ds), test_ce, user_data,
+                                      max_sessions=100, non_last_only=False)
+    else:
+        logger.warning("test conv_emb not found at %s, skip test eval", test_ce_path)
+    if os.path.exists(blind_ce_path):
+        blind_ce = torch.load(blind_ce_path, map_location="cpu", weights_only=True)
+        blind_ds = load_dataset(blind_dataset, split="test")
+        blind_gt = _build_eval_gt_ch1(iter(blind_ds), blind_ce, user_data,
+                                       max_sessions=200, non_last_only=True)
+    else:
+        logger.warning("blind conv_emb not found at %s, skip blind eval", blind_ce_path)
+
+    eval_sets = {}
+    if val_gt:   eval_sets["val_100"]         = val_gt
+    if test_gt:  eval_sets["test_100"]        = test_gt
+    if blind_gt: eval_sets["blinda_non_last"] = blind_gt
+    logger.info("Eval sets: %s", {k: len(v) for k, v in eval_sets.items()})
+
+    out_txt = os.path.join(args.checkpoint_dir, "recall_by_epoch.txt")
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write("ch1 CF-BPR Three-Tower — per-epoch recall\n")
+        f.write(f"K_EVAL={K_EVAL}\n")
+
     model     = CFBPRThreeTower(temperature=TEMPERATURE).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     ckpt_dir  = args.checkpoint_dir
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Phase 1 — train
     run_phase("train", train_samples, model, optimizer,
               track_data, user_data, all_tids, args,
-              args.train_epochs, device, ckpt_dir)
-
-    # Phase 2 — test fine-tune
-    if test_samples and args.test_epochs > 0:
-        logger.info("Phase 2: fine-tune on test split (lr=%.2e)", args.lr_finetune)
-        for pg in optimizer.param_groups:
-            pg["lr"] = args.lr_finetune
-        run_phase("test_ft", test_samples, model, optimizer,
-                  track_data, user_data, all_tids, args,
-                  args.test_epochs, device, ckpt_dir)
+              args.train_epochs, device, ckpt_dir,
+              val_samples=val_samples,
+              eval_sets=eval_sets,
+              out_txt=out_txt)
 
     final_dir = os.path.join("qwen", "cf_bpr_retrieval")
     os.makedirs(final_dir, exist_ok=True)
@@ -754,6 +931,7 @@ def train(args):
     build_item_index(model, track_data,
                      os.path.join(final_dir, "item_index"), device=device)
     logger.info("Training complete.")
+    logger.info("Recall log → %s", out_txt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -766,19 +944,14 @@ def parse_args():
                    default="config/llama1b_multi_channel_devset.yaml")
     p.add_argument("--train_conv_emb",  type=str,
                    default="qwen/hist_conversation_embeddings_train_0.6b.pt")
-    p.add_argument("--test_conv_emb",   type=str,
-                   default="qwen/hist_conversation_embeddings_test_0.6b.pt")
-    p.add_argument("--train_epochs",    type=int,  default=5)
-    p.add_argument("--test_epochs",     type=int,  default=2)
+    p.add_argument("--train_epochs",    type=int,  default=20)
     p.add_argument("--batch_size",      type=int,  default=64)
     p.add_argument("--lr",              type=float, default=1e-3)
-    p.add_argument("--lr_finetune",     type=float, default=3e-4)
     p.add_argument("--checkpoint_dir",  type=str,  default="qwen/cf_bpr_retrieval_ckpt")
     p.add_argument("--save_every",           type=int,  default=500)
     p.add_argument("--early_stop_patience",  type=int,  default=5,
-                   help="连续 N 个 epoch loss 无改善则提前停止")
-    p.add_argument("--early_stop_min_delta", type=float, default=1e-4,
-                   help="认为改善的最小 loss 下降量")
+                   help="连续 N 个 epoch val_loss 无改善则停止")
+    p.add_argument("--early_stop_min_delta", type=float, default=1e-4)
     p.add_argument("--device",              type=str,  default=None)
     return p.parse_args()
 
