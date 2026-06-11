@@ -551,10 +551,16 @@ def train(args):
         logger.error("No training samples."); return
 
     random.shuffle(all_samples)
-    val_size    = max(1, int(len(all_samples) * 0.2))
-    val_samples = all_samples[:val_size]
-    train_samples = all_samples[val_size:]
-    logger.info("Train/Val split: %d / %d", len(train_samples), len(val_samples))
+    # 按 session 级别划分，避免同 session 的不同 turn 同时出现在 train/val
+    session_ids = list(dict.fromkeys(s["session_id"] for s in all_samples))
+    random.shuffle(session_ids)
+    cut = int(len(session_ids) * 0.8)
+    train_sess = set(session_ids[:cut])
+    val_sess   = set(session_ids[cut:])
+    train_samples = [s for s in all_samples if s["session_id"] in train_sess]
+    val_samples   = [s for s in all_samples if s["session_id"] in val_sess]
+    logger.info("Session-level Train/Val split: %d sessions train / %d sessions val  (%d / %d samples)",
+                len(train_sess), len(val_sess), len(train_samples), len(val_samples))
 
     # Load track metadata-qwen3 embeddings
     logger.info("Loading track metadata-qwen3 embeddings …")
@@ -568,9 +574,13 @@ def train(args):
     blind_ce_path = args.train_conv_emb.replace("train", "blinda")
 
     logger.info("Preparing eval GT sets …")
-    # val 前100（从 train 数据按 8:2 拆出的 val_samples 里提取）
+    # val_100：从 train 数据集里按 session 维度取后 20% session 的前100条 GT
+    # 先收集所有 train session_id，取后 20% 的 session 对应的样本作为 val eval
+    train_session_ids = list(dict.fromkeys(s["session_id"] for s in all_samples))
+    val_sess_cut  = int(len(train_session_ids) * 0.8)
+    val_sess_set  = set(train_session_ids[val_sess_cut:])
     val_gt = [{"conv_emb": s["conv_emb"], "gt_tid": s["track_id"]}
-              for s in val_samples[:100]]
+              for s in all_samples if s["session_id"] in val_sess_set][:100]
     # test 前100
     test_gt = []
     if os.path.exists(test_ce_path):

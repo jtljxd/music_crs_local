@@ -857,10 +857,16 @@ def train(args):
         logger.error("No training samples."); return
 
     random.shuffle(all_samples)
-    val_size      = max(1, int(len(all_samples) * 0.2))
-    val_samples   = all_samples[:val_size]
-    train_samples = all_samples[val_size:]
-    logger.info("Train/Val split: %d / %d", len(train_samples), len(val_samples))
+    # 按 session 级别划分，避免同 session 的不同 turn 同时出现在 train/val 里
+    session_ids = list(dict.fromkeys(s["session_id"] for s in all_samples))
+    random.shuffle(session_ids)
+    cut = int(len(session_ids) * 0.8)
+    train_sess = set(session_ids[:cut])
+    val_sess   = set(session_ids[cut:])
+    train_samples = [s for s in all_samples if s["session_id"] in train_sess]
+    val_samples   = [s for s in all_samples if s["session_id"] in val_sess]
+    logger.info("Session-level Train/Val: %d sess train / %d sess val  (%d / %d samples)",
+                len(train_sess), len(val_sess), len(train_samples), len(val_samples))
 
     logger.info("Loading track data …")
     track_data = load_track_data(track_emb_db, track_meta_db, split_types)
@@ -876,11 +882,12 @@ def train(args):
     blind_ce_path = args.train_conv_emb.replace("train", "blinda")
 
     logger.info("Preparing eval GT sets …")
+    # val_100：取 val_sess 里的前 100 条 GT
     val_gt = [{"conv_emb": s["conv_emb"], "gt_tid": s["track_id"],
-               "cf_user": user_data.get(s.get("user_id"), {}).get("cf-bpr", torch.zeros(CF_BPR_DIM)).float(),
-               "age_idx": user_data.get(s.get("user_id"), {}).get("age_idx", 0),
-               "gender_idx": user_data.get(s.get("user_id"), {}).get("gender_idx", 0),
-               "country_idx": user_data.get(s.get("user_id"), {}).get("country_idx", 0)}
+               "cf_user":     user_data.get(s.get("user_id"), {}).get("cf-bpr",     torch.zeros(CF_BPR_DIM)).float(),
+               "age_idx":     user_data.get(s.get("user_id"), {}).get("age_idx",    0),
+               "gender_idx":  user_data.get(s.get("user_id"), {}).get("gender_idx", 0),
+               "country_idx": user_data.get(s.get("user_id"), {}).get("country_idx",0)}
               for s in val_samples[:100]]
     test_gt  = []
     blind_gt = []
