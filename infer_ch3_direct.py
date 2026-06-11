@@ -98,6 +98,7 @@ def _pick_cands(raw, channel: str, topk: int) -> List[str]:
         return list(raw.get(channel, []))[:topk]
 
 
+def run_inference(
     dataset_name: str,
     conv_emb_store: dict,
     retrieval_store: dict,
