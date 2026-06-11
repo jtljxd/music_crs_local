@@ -14,66 +14,66 @@ infer_ch3_direct.py
         > logs/infer_ch3_direct.log 2>&1 &
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
 import os
-import sys
+from typing import Dict, List
 
 import torch
 from datasets import load_dataset
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# 复用已有模块
-sys.path.insert(0, os.path.dirname(__file__))
-from mcrs.lm_modules.llm import load_lm_module
-from mcrs.database import MusicCatalogDB, UserProfileDB
-
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
+# ── 复用 mcrs pipeline 里的 LLM 和数据库（和 infer_bagging_blindset.py 保持一致）─
+from mcrs.db_item import MusicCatalogDB
+from mcrs.db_user import UserProfileDB
+from mcrs.lm_modules import load_lm_module
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  复用 infer_bagging_blindset.py 的工具函数
+#  工具函数（与 infer_bagging_blindset.py 完全一致）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_chat_history(conversations, item_db, target_turn: int):
-    """把 session 对话历史转成 LLM chat 格式（不含最后一条 user query）。"""
+def build_chat_history(conversations: List[Dict], item_db: MusicCatalogDB,
+                       target_turn: int) -> List[Dict]:
+    """构造 LLM 用的对话历史（target_turn 之前的所有轮次）。"""
     history = []
-    for conv in sorted(conversations, key=lambda c: int(c["turn_number"])):
-        turn = int(conv["turn_number"])
-        if turn >= target_turn:
+    for c in sorted(conversations, key=lambda x: int(x["turn_number"])):
+        tn = int(c["turn_number"])
+        if tn >= target_turn:
             break
-        role    = conv.get("role", "")
-        content = str(conv.get("content", "") or "").strip()
-        if not content:
-            continue
-        if role == "user":
-            history.append({"role": "user", "content": content})
-        elif role in ("assistant", "music"):
-            track_id = content
-            meta_str = item_db.id_to_metadata(track_id) if track_id else content
-            history.append({"role": "assistant", "content": meta_str})
+        role    = c.get("role", "")
+        content = c.get("content", "")
+        if role == "music":
+            role    = "assistant"
+            content = item_db.id_to_metadata(content)
+        history.append({"role": role, "content": content})
     return history
 
 
-def get_system_prompt(user_id, user_db, prompts_dir: str) -> str:
-    try:
-        profile = user_db.get_profile(user_id)
-    except Exception:
-        profile = {}
-    base_path = os.path.join(prompts_dir, "base_prompt.txt")
-    try:
-        with open(base_path, "r", encoding="utf-8") as f:
-            template = f.read()
-        return template.format(**profile) if profile else template
-    except Exception:
-        return "You are a helpful music recommendation assistant."
+def get_system_prompt(user_id, user_db: UserProfileDB, prompts_dir: str) -> str:
+    """构造 system prompt（带可选个性化信息）。"""
+    role_play  = open(f"{prompts_dir}/roleplay.txt",            encoding="utf-8").read()
+    resp_gen   = open(f"{prompts_dir}/response_generation.txt", encoding="utf-8").read()
+    persona    = open(f"{prompts_dir}/personalization.txt",     encoding="utf-8").read()
+    system     = role_play + resp_gen
+    if user_id:
+        try:
+            profile = user_db.id_to_profile_str(user_id)
+            system += persona + "\n" + profile
+        except Exception:
+            pass
+    return system
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +203,7 @@ def main(args):
     retrieval_store = torch.load(args.retrieval, map_location="cpu", weights_only=False)
     logger.info("  %d entries.", len(retrieval_store))
 
-    # ── LLM + DB ─────────────────────────────────────────────────────────────
+    # ── LLM + DB（与 infer_bagging_blindset.py 完全一致）───────────────────────
     lm_type = config.get("lm_type", "meta-llama/Llama-3.2-1B-Instruct")
     logger.info("Loading LLM: %s ...", lm_type)
     lm = load_lm_module(
