@@ -29,7 +29,7 @@ random.seed(SEED)
 # ── 路径配置 ──────────────────────────────────────────────────────────────────
 TRAIN_CE_PATH  = "qwen/hist_conversation_embeddings_train_0.6b.pt"
 TEST_CE_PATH   = "qwen/hist_conversation_embeddings_test_0.6b.pt"
-BLIND_CE_PATH  = "qwen/hist_conversation_embeddings_blinda_0.6b.pt"
+BLIND_CE_PATH  = "qwen/hist_conversation_embeddings_blindA_0.6b.pt"
 USER_EMB_DB    = "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"
 TRACK_EMB_DB   = "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"
 CONV_DS        = "talkpl-ai/TalkPlayData-Challenge-Dataset"

@@ -14,7 +14,7 @@ infer_bagging_blindset.py — 用训好的 BaggingReranker 对 Blind-A 做推理
 Usage (服务器):
     nohup python infer_bagging_blindset.py \\
         --config     config/llama1b_multi_channel_devset.yaml \\
-        --conv_emb   qwen/hist_conversation_embeddings_blinda_0.6b.pt \\
+        --conv_emb   qwen/hist_conversation_embeddings_blindA_0.6b.pt \\
         --retrieval  qwen/retrieval_blinda_candidates.pt \\
         --checkpoint qwen/bagging_ckpt/epoch3 \\
         --model      lgbm \\

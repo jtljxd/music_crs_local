@@ -879,7 +879,7 @@ def train(args):
     blind_dataset = (config.get("blind_dataset_name")
                      or "talkpl-ai/TalkPlayData-Challenge-Blind-A")
     test_ce_path  = args.train_conv_emb.replace("train", "test")
-    blind_ce_path = args.train_conv_emb.replace("train", "blinda")
+    blind_ce_path = args.train_conv_emb.replace("train", "blindA")
 
     logger.info("Preparing eval GT sets …")
     # val_100：取 val_sess 里的前 100 条 GT

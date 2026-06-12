@@ -7,7 +7,7 @@ infer_ch3_direct.py
 用法（服务器）:
     nohup python infer_ch3_direct.py \
         --config    config/llama1b_multi_channel_devset.yaml \
-        --conv_emb  qwen/hist_conversation_embeddings_blinda_0.6b.pt \
+        --conv_emb  qwen/hist_conversation_embeddings_blindA_0.6b.pt \
         --retrieval qwen/retrieval_blinda_candidates.pt \
         --topk      20 \
         --out       exp/inference/blindset_A/ch3_direct_top20.json \
