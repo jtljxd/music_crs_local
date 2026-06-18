@@ -142,7 +142,7 @@ def main(args: argparse.Namespace) -> None:
         try:
             bm25 = BM25_MODEL(
                 dataset_name=args.track_metadata_dataset,
-                track_split_types=args.split_types,
+                split_types=args.split_types,
                 corpus_types=["track_name", "artist_name", "album_name"],
                 cache_dir=args.cache_dir,
             )

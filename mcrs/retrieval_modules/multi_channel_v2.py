@@ -143,7 +143,7 @@ class MultiChannelRetrievalV2:
         try:
             bm25 = BM25_MODEL(
                 dataset_name=cfg.track_metadata_name,
-                track_split_types=cfg.split_types,
+                split_types=cfg.split_types,
                 corpus_types=["track_name", "artist_name", "album_name"],
                 cache_dir=cfg.cache_dir,
             )
