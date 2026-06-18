@@ -39,8 +39,14 @@ import json
 import logging
 import math
 import os
+import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+
+# Ensure project root is importable
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from datasets import load_dataset
 from tqdm import tqdm

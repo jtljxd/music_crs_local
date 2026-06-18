@@ -44,7 +44,14 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
+
+# Ensure project root is in sys.path so `mcrs` package is importable
+# when the script is run from any directory (e.g. scripts/indexing/).
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 logging.basicConfig(
     level=logging.INFO,
