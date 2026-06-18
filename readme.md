@@ -26,10 +26,41 @@ This repository provides standardized tools to evaluate music recommendation sys
 
 ---
 
+## Project Structure
+
+```
+music_crs_local/
+├── mcrs/                          # Core library (importable package)
+│   ├── __init__.py                # Factory functions: load_crs_baseline, load_crs_baseline_v2
+│   ├── crs_baseline.py            # CRS_BASELINE: retrieval → LLM generation
+│   ├── crs_baseline_v2.py         # CRS_BASELINE_V2: same pipeline, extended API
+│   ├── db_item/                   # Track metadata database
+│   ├── db_user/                   # User profile database
+│   ├── lm_modules/                # LLM generation module (Llama)
+│   ├── retrieval_modules/         # Retrieval: BM25 & BERT
+│   ├── reranking_modules/         # Reranking: placeholder for future models
+│   └── system_prompts/            # Prompt templates
+│
+├── scripts/                       # Executable scripts organized by function
+│   ├── embedding/                 # Pre-compute conversation / turn embeddings
+│   ├── indexing/                  # Build retrieval indices (BM25, BERT, etc.)
+│   ├── retrieval/                 # Pre-compute query splits & retrieval candidates
+│   ├── reranking/                 # Train & infer reranking models
+│   ├── eval/                      # Evaluate retrieval & reranking quality
+│   └── inference/                 # End-to-end inference pipelines
+│
+├── config/                        # YAML configuration files
+├── lowerbound/                    # Lower-bound baselines (random, popularity)
+├── tips/                          # Extension hints & advanced techniques
+└── exp/                           # Outputs: inference results, eval reports
+```
+
+---
+
 ## Baseline System
 
 The system operates on a **two-stage pipeline**:
-1. **RecSys** — Retrieve candidate tracks matching user preferences
+1. **RecSys** — Retrieve candidate tracks matching user preferences (BM25 or BERT)
 2. **LLM** — Generate a natural language response explaining the recommendations
 
 ### Core Components
@@ -84,10 +115,10 @@ If you do not use `all_tracks`, your evaluation may be considered invalid.
 
 ```bash
 # BM25 baseline
-python run_inference_devset.py --tid llama1b_bm25_devset --batch_size 16
+python scripts/inference/run_inference_devset.py --tid llama1b_bm25_devset --batch_size 16
 
 # BERT baseline
-python run_inference_devset.py --tid llama1b_bert_devset --batch_size 16
+python scripts/inference/run_inference_devset.py --tid llama1b_bert_devset --batch_size 16
 ```
 
 Results are saved to `exp/inference/{tid}.json`.
@@ -96,10 +127,10 @@ Results are saved to `exp/inference/{tid}.json`.
 
 ```bash
 # BM25 baseline
-python run_inference_blindset.py --tid llama1b_bm25_blindset_A --batch_size 16
+python scripts/inference/run_inference_blindset.py --tid llama1b_bm25_blindset_A --batch_size 16
 
 # BERT baseline
-python run_inference_blindset.py --tid llama1b_bert_blindset_A --batch_size 16
+python scripts/inference/run_inference_blindset.py --tid llama1b_bert_blindset_A --batch_size 16
 ```
 
 ---
@@ -132,7 +163,7 @@ attn_implementation: "flash_attention_2"
 Then run with your config:
 
 ```bash
-python run_inference_devset.py --tid my_model
+python scripts/inference/run_inference_devset.py --tid my_model
 ```
 
 ---
@@ -141,6 +172,16 @@ python run_inference_devset.py --tid my_model
 
 For evaluation, please refer to: https://github.com/nlp4musa/music-crs-evaluator
 
+To evaluate retrieval quality locally:
+
+```bash
+# Hit rate evaluation (BM25 or BERT)
+python scripts/eval/eval_retrieval_hitrate.py \
+    --retrieval_type bm25 \
+    --topk 200 \
+    --split test
+```
+
 ---
 
 ## Tips & Extensions
@@ -148,7 +189,7 @@ For evaluation, please refer to: https://github.com/nlp4musa/music-crs-evaluator
 See `./tips/` for advanced techniques. Some directions to explore:
 
 - **Improve Item Representation** — Add audio features or use stronger embedding models
-- **Add a Reranker Module** — Implement two-stage ranking with LLM or embedding-based rerankers
+- **Add a Reranker Module** — Implement two-stage ranking with LLM or embedding-based rerankers (`mcrs/reranking_modules/`)
 - **Generative Retrieval** — Use semantic IDs for end-to-end track generation
 
 ---

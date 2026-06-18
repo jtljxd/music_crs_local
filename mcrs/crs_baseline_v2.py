@@ -1,9 +1,14 @@
-"""CRS baseline with multi-channel retrieval and three-tower reranking (add_all_feature_v2).
+"""CRS baseline v2 with BM25/BERT retrieval and LLM generation.
 
 Pipeline:
-    1. Multi-channel Retrieval – Combines CF-BPR, similar users, query-metadata, query-attributes
-    2. Three-tower Reranking – Intent tower + Item tower + User tower
-    3. Generation – LLM generates response with recommended track
+    1. Retrieval  – BM25 or BERT retrieves Top-K candidates.
+    2. Generation – LLM generates a natural language response given the
+                    system prompt, conversation history, and the top
+                    retrieved track metadata.
+
+Note: Multi-channel retrieval (ch1/ch3/ch5) and three-tower reranking have
+been removed. Use CRS_BASELINE_V2 as a clean starting point to plug in a
+custom reranker later.
 """
 
 import os
@@ -13,23 +18,20 @@ from typing import Optional, Any, List, Dict
 from mcrs.db_item import MusicCatalogDB
 from mcrs.db_user import UserProfileDB
 from mcrs.lm_modules import load_lm_module
-from mcrs.retrieval_modules import MultiChannelRetrieval
-from mcrs.reranking_modules import ThreeTowerRerankerWrapper
+from mcrs.retrieval_modules import load_retrieval_module
 
 
 class CRS_BASELINE_V2:
-    """CRS baseline with multi-channel retrieval and three-tower reranking.
-    
-    This is the add_all_feature_v2 implementation with:
-    - Multi-channel retrieval (4 channels)
-    - Three-tower reranking model
-    - Same LLM generation as baseline
+    """CRS baseline v2 with BM25/BERT retrieval.
+
+    This is a clean version of the pipeline without multi-channel retrieval
+    or learned reranking models. Suitable as a base for future extensions.
     """
-    
+
     def __init__(
         self,
         lm_type: str = "meta-llama/Llama-3.2-1B-Instruct",
-        conversation_dataset_name: str = "talkpl-ai/TalkPlayData-Challenge-Dataset",
+        retrieval_type: str = "bm25",
         item_db_name: str = "talkpl-ai/TalkPlayData-Challenge-Track-Metadata",
         user_db_name: str = "talkpl-ai/TalkPlayData-Challenge-User-Metadata",
         track_emb_db_name: str = "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings",
@@ -38,35 +40,28 @@ class CRS_BASELINE_V2:
         user_split_types: List[str] = None,
         corpus_types: List[str] = None,
         cache_dir: str = "./cache",
-        qwen_model_path: str = "/home/lijiatong06/music-crs-baselines/Qwen3-Embedding-0.6B",
         device: str = "cuda",
         attn_implementation: str = "eager",
         dtype: torch.dtype = torch.bfloat16,
-        retrieval_topk: int = 350,
-        rerank_topk: int = 20,
-        reranker_lr: float = 1e-3,
-        build_indices: bool = False,  # True only during training
+        retrieval_topk: int = 20,
     ) -> None:
         """Initialize CRS baseline V2.
-        
+
         Args:
-            lm_type: LLM model identifier
-            conversation_dataset_name: Dataset with conversations and assessments
-            item_db_name: Track metadata dataset
-            user_db_name: User metadata dataset
-            track_emb_db_name: Track embeddings dataset
-            user_emb_db_name: User embeddings dataset
-            track_split_types: Dataset splits for tracks
-            user_split_types: Dataset splits for users
-            corpus_types: Metadata fields for LLM display
-            cache_dir: Cache directory
-            qwen_model_path: Path to Qwen3-Embedding-0.6B model
-            device: Compute device
-            attn_implementation: Attention implementation for LLM
-            dtype: Torch dtype for LLM
-            retrieval_topk: Number of candidates from retrieval (not used, multi-channel returns ~350)
-            rerank_topk: Number of candidates to return after reranking
-            reranker_lr: Learning rate for reranker
+            lm_type: LLM model identifier.
+            retrieval_type: Retrieval backend ("bm25" or "bert").
+            item_db_name: Track metadata dataset.
+            user_db_name: User metadata dataset.
+            track_emb_db_name: Track embeddings dataset (unused; kept for API compat).
+            user_emb_db_name: User embeddings dataset (unused; kept for API compat).
+            track_split_types: Dataset splits for tracks.
+            user_split_types: Dataset splits for users.
+            corpus_types: Metadata fields for retrieval text corpus.
+            cache_dir: Cache directory.
+            device: Compute device.
+            attn_implementation: Attention implementation for LLM.
+            dtype: Torch dtype for LLM.
+            retrieval_topk: Number of candidates to retrieve.
         """
         if track_split_types is None:
             track_split_types = ["all_tracks"]
@@ -74,10 +69,10 @@ class CRS_BASELINE_V2:
             user_split_types = ["all_users"]
         if corpus_types is None:
             corpus_types = ["track_name", "artist_name", "album_name"]
-        
+
         self.cache_dir = cache_dir
         self.lm_type = lm_type
-        self.conversation_dataset_name = conversation_dataset_name
+        self.retrieval_type = retrieval_type
         self.item_db_name = item_db_name
         self.user_db_name = user_db_name
         self.track_emb_db_name = track_emb_db_name
@@ -89,38 +84,19 @@ class CRS_BASELINE_V2:
         self.dtype = dtype
         self.attn_implementation = attn_implementation
         self.retrieval_topk = retrieval_topk
-        self.rerank_topk = rerank_topk
-        self.qwen_model_path = qwen_model_path
-        
-        # ── Load Qwen model ONCE on CPU (shared by retrieval + reranker) ──────
-        # Running Qwen on CPU avoids occupying GPU memory permanently.
-        # Query encoding is done infrequently enough that CPU speed is acceptable.
-        import logging
-        from transformers import AutoTokenizer, AutoModel
-        _logger = logging.getLogger(__name__)
-        _logger.info("Loading Qwen3-Embedding model on CPU (shared) …")
-        qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
-        qwen_model     = AutoModel.from_pretrained(qwen_model_path).cpu().eval()
 
-        # Load LLM (GPU)
+        # Load LLM
         self.lm = load_lm_module(
             self.lm_type, self.device, self.attn_implementation, self.dtype
         )
 
-        # Load multi-channel retrieval (shares Qwen on CPU)
-        self.retrieval = MultiChannelRetrieval(
-            dataset_name=self.conversation_dataset_name,
-            item_db_name=self.item_db_name,
-            user_db_name=self.user_db_name,
-            track_emb_db_name=self.track_emb_db_name,
-            user_emb_db_name=self.user_emb_db_name,
-            split_types=self.track_split_types,
-            cache_dir=self.cache_dir,
-            qwen_model_path=self.qwen_model_path,
-            device=self.device,
-            qwen_model=qwen_model,
-            qwen_tokenizer=qwen_tokenizer,
-            build_indices=build_indices,
+        # Load retrieval module (BM25 or BERT)
+        self.retrieval = load_retrieval_module(
+            self.retrieval_type,
+            self.item_db_name,
+            self.track_split_types,
+            self.corpus_types,
+            self.cache_dir,
         )
 
         # Load item and user databases
@@ -129,22 +105,6 @@ class CRS_BASELINE_V2:
         )
         self.user_db = UserProfileDB(self.user_db_name, self.user_split_types)
 
-        # Load three-tower reranker (shares Qwen on CPU)
-        self.reranker = ThreeTowerRerankerWrapper(
-            dataset_name=self.conversation_dataset_name,
-            track_emb_db_name=self.track_emb_db_name,
-            user_emb_db_name=self.user_emb_db_name,
-            track_metadata_db_name=self.item_db_name,
-            user_metadata_db_name=self.user_db_name,
-            split_types=self.track_split_types,
-            cache_dir=self.cache_dir,
-            qwen_model_path=self.qwen_model_path,
-            device=self.device,
-            lr=reranker_lr,
-            qwen_model=qwen_model,
-            qwen_tokenizer=qwen_tokenizer,
-        )
-        
         # Load prompts
         self.prompts_dir = os.path.join(os.path.dirname(__file__), "system_prompts")
         self.role_prompt = {
@@ -159,15 +119,19 @@ class CRS_BASELINE_V2:
             ).read(),
         }
         self.session_memory: List[Dict[str, Any]] = []
-    
+
+    # ------------------------------------------------------------------
+    # Session helpers
+    # ------------------------------------------------------------------
+
     def _reset_session_memory(self) -> None:
         """Clear session memory."""
         self.session_memory = []
-    
+
     def _upload_session_memory(self, chat_history: List[Dict[str, Any]]) -> None:
         """Upload chat history to session memory."""
         self.session_memory = chat_history
-    
+
     def _get_system_prompt(self, user_id: Optional[str] = None) -> str:
         """Build system prompt with optional personalization."""
         system_prompt = (
@@ -177,28 +141,20 @@ class CRS_BASELINE_V2:
             user_profile_str = self.user_db.id_to_profile_str(user_id)
             system_prompt += self.role_prompt["personalization"] + "\n" + user_profile_str
         return system_prompt
-    
+
     def _extract_history_queries(self, chat_history: List[Dict[str, Any]]) -> List[str]:
         """Extract user queries from chat history."""
-        queries = []
-        for msg in chat_history:
-            if msg.get("role") == "user":
-                queries.append(msg.get("content", ""))
-        return queries
-    
+        return [msg.get("content", "") for msg in chat_history if msg.get("role") == "user"]
+
     def _format_history_context(self, chat_history: List[Dict[str, Any]]) -> str:
         """Format chat history as a string."""
-        context = []
-        for msg in chat_history:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            context.append(f"{role}: {content}")
-        return "\n".join(context)
-    
-    def set_turn_store(self, store: dict):
-        """Inject pre-computed turn embedding store into retrieval + reranker."""
-        self.retrieval.set_turn_store(store)
-        self.reranker.set_turn_store(store)
+        return "\n".join(
+            f"{msg.get('role', '')}: {msg.get('content', '')}" for msg in chat_history
+        )
+
+    # ------------------------------------------------------------------
+    # Public inference API
+    # ------------------------------------------------------------------
 
     def chat(
         self,
@@ -210,55 +166,40 @@ class CRS_BASELINE_V2:
         session_id: Optional[str] = None,
         turn_number: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Single-turn chat.
-        
+        """Single-turn chat: retrieve → generate response.
+
         Args:
-            user_query: User's query
-            user_id: User identifier
-            session_memory: Chat history
-            conversation_goal: Conversation goal dict
-            session_date: Session date
-            
+            user_query: User's query.
+            user_id: User identifier (used for personalised system prompt).
+            session_memory: Chat history for this session.
+            conversation_goal: Unused; kept for API compatibility.
+            session_date: Unused; kept for API compatibility.
+            session_id: Unused; kept for API compatibility.
+            turn_number: Unused; kept for API compatibility.
+
         Returns:
-            Dict with retrieval_items, recommend_item, response
+            Dict with retrieval_items, recommend_item, response.
         """
         if session_memory is not None:
             self._upload_session_memory(session_memory)
-        
-        # Extract history queries
-        history_queries = self._extract_history_queries(self.session_memory)
-        
-        # Multi-channel retrieval
-        candidate_track_ids = self.retrieval.retrieve(
-            user_id=user_id,
-            current_query=user_query,
-            history_queries=history_queries,
-            session_id=session_id,
-            turn_number=turn_number,
+
+        # Build retrieval query from full conversation context
+        retrieval_input = self._format_history_context(self.session_memory)
+        if retrieval_input:
+            retrieval_input += f"\nuser: {user_query}"
+        else:
+            retrieval_input = user_query
+
+        # Retrieval
+        retrieved_items = self.retrieval.text_to_item_retrieval(
+            retrieval_input, topk=self.retrieval_topk
         )
-        
-        # Three-tower reranking
-        history_context = self._format_history_context(self.session_memory)
-        reranked_track_ids = self.reranker.rerank(
-            user_id=user_id,
-            candidate_track_ids=candidate_track_ids,
-            current_query=user_query,
-            history_context=history_context,
-            conversation_goal=conversation_goal,
-            session_date=session_date or "",
-            session_id=session_id,
-            turn_number=turn_number,
-        )
-        
-        # Take top K
-        final_track_ids = reranked_track_ids[:self.rerank_topk]
-        recommend_track_id = final_track_ids[0] if final_track_ids else None
-        
+        recommend_track_id = retrieved_items[0] if retrieved_items else None
+
         # Generate response
         if recommend_track_id:
             track_metadata_str = self.item_db.id_to_metadata(recommend_track_id)
             self.session_memory.append({"role": "user", "content": user_query})
-
             system_prompt = self._get_system_prompt(user_id)
             response = self.lm.response_generation(
                 system_prompt,
@@ -268,133 +209,92 @@ class CRS_BASELINE_V2:
             self.session_memory.append({"role": "assistant", "content": response})
         else:
             response = "I couldn't find a suitable track for you."
-        
+
         return {
             "user_id": user_id,
             "user_query": user_query,
-            "retrieval_items": final_track_ids,
+            "retrieval_items": retrieved_items,
             "recommend_item": recommend_track_id,
             "response": response,
         }
-    
+
     def batch_chat(
         self,
         batch_data: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Batch chat processing.
-        
+        """Batch chat processing: retrieve → generate.
+
         Args:
-            batch_data: List of dicts with keys: user_query, user_id, session_memory, 
-                       conversation_goal (optional), session_date (optional),
-                       session_id (optional), turn_number (optional)
-        
+            batch_data: List of dicts with keys: user_query, user_id,
+                        session_memory, conversation_goal (optional),
+                        session_date (optional), session_id (optional),
+                        turn_number (optional).
+
         Returns:
-            List of result dicts
+            List of result dicts.
         """
-        # Extract batch inputs
-        user_ids           = [d.get("user_id") for d in batch_data]
-        user_queries       = [d["user_query"] for d in batch_data]
-        session_memories   = [d.get("session_memory", []) for d in batch_data]
-        conversation_goals = [d.get("conversation_goal") for d in batch_data]
-        session_dates      = [d.get("session_date", "") for d in batch_data]
-        session_ids        = [d.get("session_id") for d in batch_data]
-        turn_numbers       = [d.get("turn_number") for d in batch_data]
-        
-        # Extract history queries for each session
-        history_queries_list = []
-        for session_memory in session_memories:
-            history_queries = self._extract_history_queries(session_memory)
-            history_queries_list.append(history_queries)
-        
+        user_ids         = [d.get("user_id") for d in batch_data]
+        user_queries     = [d["user_query"] for d in batch_data]
+        session_memories = [d.get("session_memory", []) for d in batch_data]
+
+        # Build retrieval inputs from conversation context
+        retrieval_inputs: List[str] = []
+        for sm, q in zip(session_memories, user_queries):
+            ctx = self._format_history_context(sm)
+            retrieval_inputs.append(f"{ctx}\nuser: {q}" if ctx else q)
+
         # Batch retrieval
-        batch_candidate_track_ids = self.retrieval.batch_retrieve(
-            user_ids=user_ids,
-            current_queries=user_queries,
-            history_queries_list=history_queries_list,
-            session_ids=session_ids,
-            turn_numbers=turn_numbers,
-        )
-        
-        # Batch reranking
-        history_contexts = [self._format_history_context(sm) for sm in session_memories]
-        batch_reranked_track_ids = self.reranker.batch_rerank(
-            user_ids=user_ids,
-            batch_candidate_track_ids=batch_candidate_track_ids,
-            current_queries=user_queries,
-            history_contexts=history_contexts,
-            conversation_goals=conversation_goals,
-            session_dates=session_dates,
-            session_ids=session_ids,
-            turn_numbers=turn_numbers,
-        )
-        
-        # Take top K for each
-        batch_final_track_ids = [
-            reranked[:self.rerank_topk] for reranked in batch_reranked_track_ids
-        ]
-        
-        # Get recommended tracks
-        recommend_items = [
-            tracks[0] if tracks else None for tracks in batch_final_track_ids
-        ]
-        
+        if hasattr(self.retrieval, "batch_text_to_item_retrieval"):
+            batch_retrieved = self.retrieval.batch_text_to_item_retrieval(
+                retrieval_inputs, topk=self.retrieval_topk
+            )
+        else:
+            batch_retrieved = [
+                self.retrieval.text_to_item_retrieval(inp, topk=self.retrieval_topk)
+                for inp in retrieval_inputs
+            ]
+
+        recommend_items = [items[0] if items else None for items in batch_retrieved]
+
         # Build per-sample generation inputs
-        batch_messages = []
-        for i, data in enumerate(batch_data):
-            if recommend_items[i]:
-                track_metadata_str = self.item_db.id_to_metadata(recommend_items[i])
-                system_prompt      = self._get_system_prompt(data.get("user_id"))
-                # chat_history for lm: session messages so far + current user turn
-                chat_history = list(session_memories[i]) + [
-                    {"role": "user", "content": user_queries[i]}
-                ]
-                batch_messages.append({
-                    "sys_prompt":     system_prompt,
-                    "chat_history":   chat_history,
-                    "recommend_item": track_metadata_str,
-                })
-            else:
-                batch_messages.append(None)
-        
-        # Batch generate responses using batch_response_generation
-        valid_indices   = [i for i, m in enumerate(batch_messages) if m is not None]
-        invalid_indices = [i for i, m in enumerate(batch_messages) if m is None]
+        valid_indices   = [i for i, r in enumerate(recommend_items) if r is not None]
+        invalid_indices = [i for i, r in enumerate(recommend_items) if r is None]
 
         responses = [None] * len(batch_data)
         for i in invalid_indices:
             responses[i] = "I couldn't find a suitable track for you."
 
         if valid_indices:
-            sys_prompts_valid    = [batch_messages[i]["sys_prompt"]    for i in valid_indices]
-            chat_histories_valid = [batch_messages[i]["chat_history"]  for i in valid_indices]
-            recommend_items_valid = [batch_messages[i]["recommend_item"] for i in valid_indices]
+            sys_prompts_valid     = [self._get_system_prompt(user_ids[i]) for i in valid_indices]
+            chat_histories_valid  = [
+                list(session_memories[i]) + [{"role": "user", "content": user_queries[i]}]
+                for i in valid_indices
+            ]
+            recommend_strs_valid  = [
+                self.item_db.id_to_metadata(recommend_items[i]) for i in valid_indices
+            ]
 
             if hasattr(self.lm, "batch_response_generation"):
                 generated = self.lm.batch_response_generation(
-                    sys_prompts_valid, chat_histories_valid, recommend_items_valid
+                    sys_prompts_valid, chat_histories_valid, recommend_strs_valid
                 )
             else:
                 generated = [
                     self.lm.response_generation(sp, ch, ri)
-                    for sp, ch, ri in zip(sys_prompts_valid, chat_histories_valid, recommend_items_valid)
+                    for sp, ch, ri in zip(
+                        sys_prompts_valid, chat_histories_valid, recommend_strs_valid
+                    )
                 ]
-
             for idx, gen in zip(valid_indices, generated):
                 responses[idx] = gen
-        
-        # Build results
+
         results = []
         for i, data in enumerate(batch_data):
             results.append({
                 "user_id": data.get("user_id"),
                 "user_query": user_queries[i],
-                "retrieval_items": batch_final_track_ids[i],
+                "retrieval_items": batch_retrieved[i],
                 "recommend_item": recommend_items[i],
                 "response": responses[i],
             })
-        
         return results
-    
-    def save_reranker(self) -> None:
-        """Save reranker checkpoint."""
-        self.reranker.save_checkpoint()

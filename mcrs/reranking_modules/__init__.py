@@ -1,2 +1,3 @@
-from .fm_reranker import FMReranker
-from .three_tower_reranker import ThreeTowerRerankerWrapper
+# Reranking modules placeholder.
+# Rerankers (FMReranker, ThreeTowerReranker) have been removed.
+# This package is reserved for future reranking implementations.
