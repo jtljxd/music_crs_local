@@ -211,9 +211,21 @@ class MultiChannelRetrievalV2:
             from datasets import concatenate_datasets as _cat2
             u_all = _cat2([u_ds[s] for s in u_splits])
             loaded_cf = 0
+            # Log available column names on first row to help debug field name issues
+            _first_row = None
             for row in u_all:
+                if _first_row is None:
+                    _first_row = row
+                    cf_cols = [k for k in row.keys() if "cf" in k.lower() or "bpr" in k.lower() or "embed" in k.lower()]
+                    logger.info("  User metadata columns (CF-related): %s", cf_cols)
+                    logger.info("  All columns: %s", list(row.keys())[:20])
                 uid = str(row.get("user_id", ""))
-                cf_vec = row.get("user_cf-bpr")
+                # Try multiple possible field names for CF-BPR embedding
+                cf_vec = (row.get("user_cf-bpr")
+                          or row.get("cf_bpr")
+                          or row.get("cf-bpr")
+                          or row.get("user_cf_bpr")
+                          or row.get("embedding"))
                 if uid and cf_vec is not None:
                     try:
                         t = torch.tensor(cf_vec, dtype=torch.float32)
@@ -322,11 +334,21 @@ class MultiChannelRetrievalV2:
         ctx.genre_emb  = self.genre_store.get(f"{session_id}_{turn_number}_genre")
         ctx.decade_emb = self.decade_store.get(f"{session_id}_{turn_number}_decade")
 
-        # ── History tracks ────────────────────────────────────────────────────
+        # ── History tracks ────────────────────────────────────────────────────────
         convs = session_data.get("conversations", [])
         pos_ids:  List[str] = []
         neg_ids:  List[str] = []
         last_tid: Optional[str] = None
+
+        # goal_progress_assessments is a top-level list (separate from conversations):
+        #   [{"turn_number": 2, "goal_progress_assessment": "MOVES_TOWARD_GOAL"}, ...]
+        # Convention: assessment at turn T is the feedback on the music at turn T-1.
+        assessments = session_data.get("goal_progress_assessments", [])
+        asmt_map: Dict[int, str] = {
+            int(a["turn_number"]): (a.get("goal_progress_assessment") or "")
+            for a in assessments
+            if isinstance(a, dict) and a.get("turn_number") is not None
+        }
 
         for c in sorted(convs, key=lambda x: int(x.get("turn_number", 0))):
             t = int(c.get("turn_number", 0))
@@ -334,11 +356,18 @@ class MultiChannelRetrievalV2:
                 continue
             if c.get("role") == "music" and c.get("content"):
                 last_tid = c["content"]
-                label = c.get("label", "") or ""
+                track_id = c["content"]
+                # Priority 1: inline label field in the conversation turn
+                inline_label = c.get("label") or c.get("goal_progress_assessment") or ""
+                # Priority 2: assessment keyed at turn T+1 references music at turn T
+                next_turn_label = asmt_map.get(t + 1, "")
+                # Priority 3: assessment keyed directly at turn T
+                same_turn_label = asmt_map.get(t, "")
+                label = inline_label or next_turn_label or same_turn_label
                 if "MOVES_TOWARD_GOAL" in label:
-                    pos_ids.append(c["content"])
+                    pos_ids.append(track_id)
                 else:
-                    neg_ids.append(c["content"])
+                    neg_ids.append(track_id)
 
         ctx.last_track_id = last_tid
         ctx.pos_track_ids = pos_ids
@@ -383,7 +412,7 @@ class MultiChannelRetrievalV2:
         results: Dict[str, List[str]] = {}
 
         # ── CH01 CF-BPR — handle quota redistribution ─────────────────────────
-        cf_k    = cfg.topk_per_channel.get("CH01_CF_BPR", 30)
+        cf_k    = cfg.topk_per_channel.get("CH01_CF_BPR", 200)
         ch01_res = ch01_cf_bpr(ctx, self.index, cf_k)
         results["CH01_CF_BPR"] = ch01_res
         skipped_cf_quota = cf_k if not ch01_res else 0
@@ -408,7 +437,7 @@ class MultiChannelRetrievalV2:
             results[ch_name] = res
 
         # ── CH23 BM25 ─────────────────────────────────────────────────────────
-        bm25_k = cfg.topk_per_channel.get("CH23_BM25", 15)
+        bm25_k = cfg.topk_per_channel.get("CH23_BM25", 200)
         results["CH23_BM25"] = ch23_bm25(ctx, self.bm25, bm25_k)
 
         # ── Trained model channels (optional) ─────────────────────────────────
