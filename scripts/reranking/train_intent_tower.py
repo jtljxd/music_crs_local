@@ -110,11 +110,10 @@ class IntentTowerDataset(Dataset):
         user_id    = s.get("user_id", "")
 
         # ── User side ─────────────────────────────────────────────────────────
-        query_emb = (
-            self.query_store.get(f"{sid}_{turn}_query")
-            or self.query_store.get(f"{sid}_{turn}")
-            or torch.zeros(1024)
-        )
+        _q = self.query_store.get(f"{sid}_{turn}_query")
+        if _q is None:
+            _q = self.query_store.get(f"{sid}_{turn}")
+        query_emb = _q if _q is not None else torch.zeros(1024)
         goal_emb = self.goal_store.get(sid, torch.zeros(1024))
 
         # Profile features from user metadata

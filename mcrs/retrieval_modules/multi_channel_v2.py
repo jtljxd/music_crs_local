@@ -325,8 +325,10 @@ class MultiChannelRetrievalV2:
         ctx.goal_emb = self.goal_store.get(session_id)
 
         # ── BGE genre / decade ────────────────────────────────────────────────
-        ctx.genre_emb  = self.genre_store.get(f"{session_id}_{turn_number}_genre")
-        ctx.decade_emb = self.decade_store.get(f"{session_id}_{turn_number}_decade")
+        _gk = f"{session_id}_{turn_number}"
+        _g = self.genre_store.get(_gk)
+        ctx.genre_emb = _g if _g is not None else self.genre_store.get(f"{_gk}_genre")
+        ctx.decade_emb = self.decade_store.get(f"{_gk}_decade")
 
         # ── History tracks ────────────────────────────────────────────────────────
         convs = session_data.get("conversations", [])
