@@ -77,8 +77,11 @@ class CFTower(nn.Module):
     def encode_user(self, user_cf: torch.Tensor) -> torch.Tensor:
         """Inference: user CF-BPR → 32-dim vector."""
         dev = next(self.parameters()).device
+        x = user_cf.float().to(dev)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)  # [1, 128]
         with torch.no_grad():
-            return F.normalize(self.user_tower(user_cf.float().to(dev)), p=2, dim=1)
+            return F.normalize(self.user_tower(x), p=2, dim=1).squeeze(0)
 
     def encode_track(self, track_cf: torch.Tensor) -> torch.Tensor:
         """Inference: track CF-BPR → 32-dim vector."""
