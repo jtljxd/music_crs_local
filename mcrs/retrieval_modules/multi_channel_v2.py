@@ -310,17 +310,14 @@ class MultiChannelRetrievalV2:
 
         # ── Query embedding ───────────────────────────────────────────────────
         # Try key formats: "{session_id}_{turn}_query" or "{session_id}_{turn}"
-        ctx.query_emb = (
-            self.query_store.get(f"{session_id}_{turn_number}_query")
-            or self.query_store.get(f"{session_id}_{turn_number}")
-        )
+        # NOTE: cannot use `or` on Tensors (ambiguous bool) — use explicit None check
+        _q = self.query_store.get(f"{session_id}_{turn_number}_query")
+        ctx.query_emb = _q if _q is not None else self.query_store.get(f"{session_id}_{turn_number}")
 
         # Previous turn query
         if turn_number > 1:
-            ctx.prev_query_emb = (
-                self.query_store.get(f"{session_id}_{turn_number - 1}_query")
-                or self.query_store.get(f"{session_id}_{turn_number - 1}")
-            )
+            _pq = self.query_store.get(f"{session_id}_{turn_number - 1}_query")
+            ctx.prev_query_emb = _pq if _pq is not None else self.query_store.get(f"{session_id}_{turn_number - 1}")
 
         # ── Goal embedding ────────────────────────────────────────────────────
         ctx.goal_emb = self.goal_store.get(session_id)

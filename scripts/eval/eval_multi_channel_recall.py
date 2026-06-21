@@ -140,6 +140,15 @@ def evaluate(args: argparse.Namespace) -> None:
         if not music_turns:
             continue
 
+        # --non_last_only: skip the last music turn in each session
+        # (mirrors blind-A evaluation convention where the last turn is the target)
+        if args.non_last_only and len(music_turns) > 1:
+            last_music_turn = max(music_turns.keys())
+            music_turns = {t: tid for t, tid in music_turns.items() if t != last_music_turn}
+        elif args.non_last_only and len(music_turns) == 1:
+            # Only one music turn — skip entire session
+            continue
+
         for turn_number, gt_track_id in music_turns.items():
             total_turns += 1
 
@@ -284,6 +293,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topk", type=int, default=200)
     p.add_argument("--max_sessions", type=int, default=0,
                    help="Limit sessions for quick debug (0 = all).")
+    p.add_argument("--non_last_only", action="store_true", default=False,
+                   help="Only evaluate non-last music turns per session (for blind-A style eval).")
     p.add_argument("--device", type=str, default="cuda",
                    choices=["cuda", "cpu"])
     return p.parse_args()
