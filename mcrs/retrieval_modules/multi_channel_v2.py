@@ -56,9 +56,6 @@ class MultiChannelConfig:
     device              : "cuda" or "cpu"
     topk_per_channel    : override per-channel k (dict channel_name → k)
     cf_quota_redistrib  : if True, redistribute CH01 quota when user has no CF
-    intent_model_path   : path to trained intent-tower checkpoint (optional)
-    profile_model_path  : path to trained profile-tower checkpoint (optional)
-    cf_tower_model_path : path to trained CF-tower checkpoint (optional)
     """
     track_emb_dataset:    str              = "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"
     track_metadata_name:  str              = "talkpl-ai/TalkPlayData-Challenge-Track-Metadata"
@@ -76,9 +73,6 @@ class MultiChannelConfig:
     device:               str              = "cpu"
     topk_per_channel:     Dict[str, int]   = field(default_factory=dict)
     cf_quota_redistrib:   bool             = True
-    intent_model_path:    Optional[str]    = None
-    profile_model_path:   Optional[str]    = None
-    cf_tower_model_path:  Optional[str]    = None
 
 
 # ── Main class ─────────────────────────────────────────────────────────────────
@@ -106,9 +100,6 @@ class MultiChannelRetrievalV2:
         album_to_tracks:    Optional[Dict[str, List[str]]] = None,
         # user CF-BPR embeddings store: user_id → Tensor[128]
         user_cf_store:      Optional[Dict[str, torch.Tensor]] = None,
-        intent_model        = None,
-        profile_model       = None,
-        cf_tower_model      = None,
     ):
         self.index           = index
         self.bm25            = bm25
@@ -122,9 +113,6 @@ class MultiChannelRetrievalV2:
         self.artist_to_tracks = artist_to_tracks or {}
         self.album_to_tracks  = album_to_tracks  or {}
         self.user_cf_store   = user_cf_store or {}
-        self.intent_model    = intent_model
-        self.profile_model   = profile_model
-        self.cf_tower_model  = cf_tower_model
 
     # ── factory ────────────────────────────────────────────────────────────────
 
@@ -235,54 +223,6 @@ class MultiChannelRetrievalV2:
         except Exception as e:
             logger.warning("User CF-BPR store build failed (%s) — CH01 disabled.", e)
 
-        # Trained models (optional, lazy import to avoid mandatory deps)
-        intent_model = profile_model = cf_tower_model = None
-        if cfg.intent_model_path:
-            try:
-                from mcrs.tower_models.intent_tower import IntentTower
-                intent_model = IntentTower.load(cfg.intent_model_path, cfg.device)
-                logger.info("Intent tower loaded from %s", cfg.intent_model_path)
-            except Exception as e:
-                logger.warning("Intent tower load failed (%s)", e)
-
-        if cfg.profile_model_path:
-            try:
-                from mcrs.tower_models.profile_tower import ProfileTower
-                profile_model = ProfileTower.load(cfg.profile_model_path, cfg.device)
-                logger.info("Profile tower loaded from %s", cfg.profile_model_path)
-            except Exception as e:
-                logger.warning("Profile tower load failed (%s)", e)
-
-        if cfg.cf_tower_model_path:
-            try:
-                from mcrs.tower_models.cf_tower import CFTower
-                cf_tower_model = CFTower.load(cfg.cf_tower_model_path, cfg.device)
-                logger.info("CF tower loaded from %s", cfg.cf_tower_model_path)
-                # Pre-compute 32-dim track vectors and register as 'cf_tower' modality
-                if index.has_modality("cf_bpr"):
-                    logger.info("Pre-computing CF-tower track embeddings (32-dim) …")
-                    cf_tower_model.eval()
-                    batch_size = 2048
-                    n = len(index.track_ids)
-                    all_vecs = []
-                    with torch.no_grad():
-                        for i in range(0, n, batch_size):
-                            batch_ids = index.track_ids[i:i+batch_size]
-                            def _gv(tid):
-                                v = index.get_vec("cf_bpr", tid)
-                                return v if v is not None else torch.zeros(128)
-                            raw = torch.stack([_gv(tid) for tid in batch_ids])  # [B, 128]
-                            dev = next(cf_tower_model.parameters()).device
-                            enc = torch.nn.functional.normalize(
-                                cf_tower_model.track_tower(raw.float().to(dev)), p=2, dim=1
-                            ).cpu()  # [B, 32]
-                            all_vecs.append(enc)
-                    cf_tower_mat = torch.cat(all_vecs, dim=0)  # [N, 32]
-                    index.register_modality("cf_tower", cf_tower_mat)
-                    logger.info("CF-tower modality registered: %d tracks × 32-dim", cf_tower_mat.shape[0])
-            except Exception as e:
-                logger.warning("CF tower load failed (%s)", e)
-
         return cls(
             index=index, bm25=bm25, cfg=cfg,
             goal_store=goal_store, query_store=query_store,
@@ -292,9 +232,6 @@ class MultiChannelRetrievalV2:
             artist_to_tracks=artist_to_tracks,
             album_to_tracks=album_to_tracks,
             user_cf_store=user_cf_store,
-            intent_model=intent_model,
-            profile_model=profile_model,
-            cf_tower_model=cf_tower_model,
         )
 
     # ── Context builder ────────────────────────────────────────────────────────
@@ -458,36 +395,6 @@ class MultiChannelRetrievalV2:
         bm25_k = cfg.topk_per_channel.get("CH23_BM25", 200)
         results["CH23_BM25"] = ch23_bm25(ctx, self.bm25, bm25_k)
 
-        # ── Trained model channels (optional) ─────────────────────────────────
-        if self.intent_model is not None:
-            try:
-                intent_k = cfg.topk_per_channel.get("CH_Intent", 200)
-                intent_vec = self.intent_model.encode_query(ctx)
-                results["CH_Intent"] = self.index.topk("metadata", intent_vec, intent_k)
-            except Exception as e:
-                logger.warning("Intent tower channel failed: %s", e)
-                results["CH_Intent"] = []
-
-        if self.profile_model is not None:
-            try:
-                profile_k = cfg.topk_per_channel.get("CH_Profile", 200)
-                profile_vec = self.profile_model.encode_query(ctx)
-                results["CH_Profile"] = self.index.topk("metadata", profile_vec, profile_k)
-            except Exception as e:
-                logger.warning("Profile tower channel failed: %s", e)
-                results["CH_Profile"] = []
-
-        if self.cf_tower_model is not None and ctx.user_cf_emb is not None:
-            try:
-                cf_t_k = cfg.topk_per_channel.get("CH_CF_Tower", 200)
-                cf_vec = self.cf_tower_model.encode_user(ctx.user_cf_emb)  # [32]
-                # Use pre-computed cf_tower modality (32-dim)
-                modality = "cf_tower" if self.index.has_modality("cf_tower") else "cf_bpr"
-                results["CH_CF_Tower"] = self.index.topk(modality, cf_vec, cf_t_k)
-            except Exception as e:
-                logger.warning("CF tower channel failed: %s", e)
-                results["CH_CF_Tower"] = []
-
         # ── Merge via Reciprocal Rank Fusion (RRF) ────────────────────────────
         # score(d) = Σ_channel  weight[channel] / (RRF_K + rank[channel])
         # Channels absent or empty get no contribution.
@@ -526,9 +433,6 @@ class MultiChannelRetrievalV2:
             "CH18_Pos_Lyrics":       1.5,
             "CH19_Pos_Attributes":   1.5,
             # Trained model towers — high when available
-            "CH_Intent":             3.5,
-            "CH_Profile":            2.5,
-            "CH_CF_Tower":           3.0 if ctx.has_user_cf else 0.0,
         }
 
         rrf_scores: Dict[str, float] = {}
@@ -556,10 +460,4 @@ class MultiChannelRetrievalV2:
         """Return all channel names in registry order."""
         names = [ch_name for ch_name, _, _ in DIRECT_CHANNELS]
         names.append("CH23_BM25")
-        if self.intent_model:
-            names.append("CH_Intent")
-        if self.profile_model:
-            names.append("CH_Profile")
-        if self.cf_tower_model:
-            names.append("CH_CF_Tower")
         return names

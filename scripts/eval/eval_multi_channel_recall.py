@@ -59,7 +59,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Evaluation cutoffs
-RECALL_KS = [20, 30, 50, 100, 150, 200]
+RECALL_KS = [20, 30, 50, 100, 150, 200, 300, 400, 500]
 NDCG_K    = 20
 
 
@@ -101,9 +101,6 @@ def evaluate(args: argparse.Namespace) -> None:
         # genre_emb_path doubles as turn_query BGE emb path (--turn_query_emb_path overrides)
         genre_emb_path      = args.turn_query_emb_path or args.genre_emb_path,
         decade_emb_path     = args.decade_emb_path,
-        intent_model_path   = args.intent_model_path,
-        profile_model_path  = args.profile_model_path,
-        cf_tower_model_path = args.cf_tower_model_path,
         device              = args.device,
     )
     retrieval = MultiChannelRetrievalV2.build(cfg)
@@ -305,13 +302,6 @@ def parse_args() -> argparse.Namespace:
                    help="Limit sessions for quick debug (0 = all).")
     p.add_argument("--non_last_only", action="store_true", default=False,
                    help="Only evaluate non-last music turns per session (for blind-A style eval).")
-    # ── Trained model tower paths (optional) ──
-    p.add_argument("--intent_model_path",   type=str, default=None,
-                   help="Path to trained intent tower checkpoint (.pt)")
-    p.add_argument("--profile_model_path",  type=str, default=None,
-                   help="Path to trained profile tower checkpoint (.pt)")
-    p.add_argument("--cf_tower_model_path", type=str, default=None,
-                   help="Path to trained CF tower checkpoint (.pt)")
     p.add_argument("--device", type=str, default="cuda",
                    choices=["cuda", "cpu"])
     return p.parse_args()
