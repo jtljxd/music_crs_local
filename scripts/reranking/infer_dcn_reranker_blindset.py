@@ -303,8 +303,9 @@ def run(args: argparse.Namespace) -> None:
 
         q = None
         for t in range(target_turn, -1, -1):
-            q = (query_store.get(f"{session_id}_{t}_query")
-                 or query_store.get(f"{session_id}_{t}"))
+            q = query_store.get(f"{session_id}_{t}_query")
+            if q is None:
+                q = query_store.get(f"{session_id}_{t}")
             if q is not None:
                 break
         query_emb_vec = (q.float() if q is not None else torch.zeros(1024)).unsqueeze(0)  # [1, 1024]

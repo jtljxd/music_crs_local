@@ -208,8 +208,9 @@ class DCNDataset(Dataset):
         conv_goal = torch.cat([torch.zeros(8), ge, torch.zeros(4)])  # [1036]
 
         # ── query_emb [1024] ───────────────────────────────────────────────
-        q = (self.query_store.get(f"{sid}_{turn}_query")
-             or self.query_store.get(f"{sid}_{turn}"))
+        q = self.query_store.get(f"{sid}_{turn}_query")
+        if q is None:
+            q = self.query_store.get(f"{sid}_{turn}")
         query_emb = q.float() if q is not None else torch.zeros(1024)
 
         # ── positive track features ────────────────────────────────────────
