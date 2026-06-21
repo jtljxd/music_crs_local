@@ -143,8 +143,23 @@ class IntentTower(nn.Module):
         pop_bucket:    torch.Tensor,
         year_bucket:   torch.Tensor,
         dur_bucket:    torch.Tensor,
+        # Negatives (optional): each [B, K, dim]
+        neg_meta:    Optional[torch.Tensor] = None,
+        neg_lyrics:  Optional[torch.Tensor] = None,
+        neg_attr:    Optional[torch.Tensor] = None,
+        neg_audio:   Optional[torch.Tensor] = None,
+        neg_image:   Optional[torch.Tensor] = None,
+        neg_cf:      Optional[torch.Tensor] = None,
+        neg_pop:     Optional[torch.Tensor] = None,
+        neg_year:    Optional[torch.Tensor] = None,
+        neg_dur:     Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Return loss dict for training."""
+        """Return loss dict for training.
+
+        When neg_* tensors are provided (shape [B, K, dim]), uses
+        1-pos + K-neg cross-entropy (label=0 for all samples).
+        Otherwise falls back to in-batch NT-Xent.
+        """
         intent_vec = self.intent_encoder(
             query_emb, goal_emb, category_emb, spec_emb, date_emb, profile_emb
         )
@@ -152,11 +167,27 @@ class IntentTower(nn.Module):
             metadata_emb, lyrics_emb, attr_emb, audio_emb, image_emb,
             cf_bpr, pop_bucket, year_bucket, dur_bucket
         )
-        # In-batch contrastive loss (NT-Xent style)
         temp = self.temperature.exp().clamp(max=100)
-        logits = torch.matmul(intent_vec, track_vec.T) * temp   # [B, B]
-        labels = torch.arange(logits.size(0), device=logits.device)
-        loss   = F.cross_entropy(logits, labels)
+        if neg_meta is not None:
+            # Encode negatives: flatten [B, K, dim] -> [B*K, dim] -> encode -> [B, K, 128]
+            B, K = neg_meta.shape[:2]
+            def _flat(t): return t.reshape(B * K, -1)
+            neg_enc = self.track_encoder(
+                _flat(neg_meta),   _flat(neg_lyrics), _flat(neg_attr),
+                _flat(neg_audio),  _flat(neg_image),  _flat(neg_cf),
+                _flat(neg_pop),    _flat(neg_year),   _flat(neg_dur),
+            )  # [B*K, 128]
+            neg_vecs = neg_enc.reshape(B, K, -1)  # [B, K, 128]
+            # pos score: [B, 1];  neg scores: [B, K]  ->  logits: [B, 1+K]
+            pos_score = (intent_vec * track_vec).sum(dim=1, keepdim=True) * temp
+            neg_score = torch.bmm(neg_vecs, intent_vec.unsqueeze(2)).squeeze(2) * temp
+            logits = torch.cat([pos_score, neg_score], dim=1)  # [B, 1+K]
+            labels = torch.zeros(B, dtype=torch.long, device=logits.device)
+        else:
+            # In-batch NT-Xent fallback
+            logits = torch.matmul(intent_vec, track_vec.T) * temp  # [B, B]
+            labels = torch.arange(logits.size(0), device=logits.device)
+        loss = F.cross_entropy(logits, labels)
         return {"loss": loss, "intent_vec": intent_vec, "track_vec": track_vec}
 
     def encode_intent(
