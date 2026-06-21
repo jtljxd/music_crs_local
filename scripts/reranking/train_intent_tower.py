@@ -91,6 +91,7 @@ class IntentTowerDataset(Dataset):
         goal_store:       Dict,
         track_meta:       Dict[str, dict],  # track_id → metadata dict
         user_meta:        Dict[str, dict],  # user_id → metadata dict
+        num_neg:          int = 15,         # random negatives per sample
     ):
         self.samples     = samples
         self.index       = index_store
@@ -98,6 +99,8 @@ class IntentTowerDataset(Dataset):
         self.goal_store  = goal_store
         self.track_meta  = track_meta
         self.user_meta   = user_meta
+        self.num_neg     = num_neg
+        self.all_track_ids = list(index_store.track_ids)
 
     def __len__(self):
         return len(self.samples)
@@ -146,7 +149,7 @@ class IntentTowerDataset(Dataset):
             lyr_emb   = _gv("lyrics",     1024)
             attr_emb  = _gv("attributes", 1024)
             audio_emb = _gv("audio",       512)
-            image_emb = _gv("image",      1152)
+            image_emb = _gv("image",       768)
             cf_emb    = _gv("cf_bpr",      128)
             tm = self.track_meta.get(track_id, {})
             pop_b  = _bucket_emb(tm.get("popularity"),     8,   0, 100)
@@ -158,6 +161,19 @@ class IntentTowerDataset(Dataset):
 
         track_vecs = _get_track_vecs(gt_track)
 
+        # Sample random negatives (exclude gt_track)
+        import random as _random
+        neg_ids = []
+        while len(neg_ids) < self.num_neg:
+            cand = _random.choice(self.all_track_ids)
+            if cand != gt_track:
+                neg_ids.append(cand)
+
+        # Stack neg track vecs: each elem → [num_neg, dim]
+        neg_list = [_get_track_vecs(nid) for nid in neg_ids]
+        def _stack_neg(field_idx, fallback_dim):
+            return torch.stack([nv[field_idx] for nv in neg_list])  # [num_neg, dim]
+
         return {
             # User
             "query_emb":    query_emb.float(),
@@ -166,7 +182,7 @@ class IntentTowerDataset(Dataset):
             "spec_emb":     specificity_emb,
             "date_emb":     date_emb,
             "profile_emb":  profile_emb,
-            # Track (positive)
+            # Track (positive) — shape [dim]
             "t_meta":   track_vecs[0],
             "t_lyrics": track_vecs[1],
             "t_attr":   track_vecs[2],
@@ -176,6 +192,16 @@ class IntentTowerDataset(Dataset):
             "t_pop":    track_vecs[6],
             "t_year":   track_vecs[7],
             "t_dur":    track_vecs[8],
+            # Track (negatives) — shape [num_neg, dim]
+            "n_meta":   _stack_neg(0, 1024),
+            "n_lyrics": _stack_neg(1, 1024),
+            "n_attr":   _stack_neg(2, 1024),
+            "n_audio":  _stack_neg(3,  512),
+            "n_image":  _stack_neg(4,  768),
+            "n_cf":     _stack_neg(5,  128),
+            "n_pop":    _stack_neg(6,    8),
+            "n_year":   _stack_neg(7,    8),
+            "n_dur":    _stack_neg(8,    8),
         }
 
 
@@ -301,7 +327,7 @@ def train(args: argparse.Namespace) -> None:
     # ── DataLoaders ────────────────────────────────────────────────────────────
     def _make_loader(samples, shuffle):
         ds = IntentTowerDataset(samples, index, query_store, goal_store,
-                                track_meta, user_meta)
+                                track_meta, user_meta, num_neg=args.num_neg)
         return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle,
                           num_workers=args.num_workers, pin_memory=True)
 
@@ -335,6 +361,11 @@ def train(args: argparse.Namespace) -> None:
                 batch["t_meta"],    batch["t_lyrics"],  batch["t_attr"],
                 batch["t_audio"],   batch["t_image"],   batch["t_cf"],
                 batch["t_pop"],     batch["t_year"],    batch["t_dur"],
+                neg_meta=batch["n_meta"],   neg_lyrics=batch["n_lyrics"],
+                neg_attr=batch["n_attr"],   neg_audio=batch["n_audio"],
+                neg_image=batch["n_image"], neg_cf=batch["n_cf"],
+                neg_pop=batch["n_pop"],     neg_year=batch["n_year"],
+                neg_dur=batch["n_dur"],
             )
             loss = out["loss"]
             loss.backward()
@@ -355,6 +386,11 @@ def train(args: argparse.Namespace) -> None:
                     batch["t_meta"],    batch["t_lyrics"],  batch["t_attr"],
                     batch["t_audio"],   batch["t_image"],   batch["t_cf"],
                     batch["t_pop"],     batch["t_year"],    batch["t_dur"],
+                    neg_meta=batch["n_meta"],   neg_lyrics=batch["n_lyrics"],
+                    neg_attr=batch["n_attr"],   neg_audio=batch["n_audio"],
+                    neg_image=batch["n_image"], neg_cf=batch["n_cf"],
+                    neg_pop=batch["n_pop"],     neg_year=batch["n_year"],
+                    neg_dur=batch["n_dur"],
                 )
                 val_losses.append(out["loss"].item())
 
@@ -404,6 +440,8 @@ def parse_args():
     p.add_argument("--dropout",         type=float, default=0.3)
     p.add_argument("--patience",        type=int,   default=5)
     p.add_argument("--num_workers",     type=int,   default=4)
+    p.add_argument("--num_neg",          type=int,   default=15,
+                   help="Number of random negatives per training sample")
     p.add_argument("--device",          type=str,   default="cuda")
     return p.parse_args()
 

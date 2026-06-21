@@ -83,7 +83,7 @@ class TrackEncoderIntent(nn.Module):
     LYRICS_DIM  = 1024
     ATTR_DIM    = 1024
     AUDIO_DIM   = 512
-    IMAGE_DIM   = 1152
+    IMAGE_DIM   = 768
     CF_DIM      = 128
     BUCKET_DIM  = 8    # each of: popularity, release_year, duration
     OUT_DIM     = 128
