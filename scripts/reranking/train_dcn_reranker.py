@@ -30,6 +30,11 @@ Usage example:
 
 from __future__ import annotations
 
+import sys, os
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import argparse
 import json
 import logging
