@@ -343,8 +343,8 @@ def run_turn_query_mode(args, tokenizer, model, device: str):
         store = torch.load(out_path, map_location="cpu", weights_only=True)
         logger.info("  %d entries already cached.", len(store))
 
-    logger.info("Loading conversation dataset %s (split=%s) …", args.conv_dataset, args.split_name)
-    ds = _load_ds(args.conv_dataset, split=args.split_name)
+    logger.info("Loading conversation dataset %s (split=%s) …", args.conv_dataset, args.hf_split)
+    ds = _load_ds(args.conv_dataset, split=args.hf_split)
     logger.info("  %d sessions.", len(ds))
 
     # Collect all user turns that haven't been encoded yet
@@ -541,6 +541,11 @@ def parse_args():
         "--conv_dataset", type=str,
         default="talkpl-ai/TalkPlayData-Challenge-Dataset",
         help="HuggingFace conversation dataset for turn_query mode",
+    )
+    tq.add_argument(
+        "--hf_split", type=str, default="test",
+        help="HuggingFace dataset split to load (e.g. 'train', 'test'). "
+             "Use 'test' for Blind-A (it only has a test split).",
     )
     # split_name is shared with query mode (already defined above)
 
