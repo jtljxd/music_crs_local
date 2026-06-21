@@ -144,6 +144,13 @@ class IndexStore:
     def has_modality(self, modality: str) -> bool:
         return modality in self.matrices
 
+    def register_modality(self, modality: str, matrix: torch.Tensor) -> None:
+        """Register a new modality matrix [N, D] (must match track_ids order)."""
+        assert matrix.shape[0] == len(self.track_ids), (
+            f"register_modality: matrix rows {matrix.shape[0]} != track_ids {len(self.track_ids)}"
+        )
+        self.matrices[modality] = matrix.to(self.device)
+
     def get_vec(self, modality: str, track_id: str) -> Optional[torch.Tensor]:
         """Return the raw (normalised) embedding for a specific track."""
         idx = self._id_to_idx.get(track_id)

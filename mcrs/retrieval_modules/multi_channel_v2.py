@@ -258,6 +258,28 @@ class MultiChannelRetrievalV2:
                 from mcrs.tower_models.cf_tower import CFTower
                 cf_tower_model = CFTower.load(cfg.cf_tower_model_path, cfg.device)
                 logger.info("CF tower loaded from %s", cfg.cf_tower_model_path)
+                # Pre-compute 32-dim track vectors and register as 'cf_tower' modality
+                if index.has_modality("cf_bpr"):
+                    logger.info("Pre-computing CF-tower track embeddings (32-dim) …")
+                    cf_tower_model.eval()
+                    batch_size = 2048
+                    n = len(index.track_ids)
+                    all_vecs = []
+                    with torch.no_grad():
+                        for i in range(0, n, batch_size):
+                            batch_ids = index.track_ids[i:i+batch_size]
+                            def _gv(tid):
+                                v = index.get_vec("cf_bpr", tid)
+                                return v if v is not None else torch.zeros(128)
+                            raw = torch.stack([_gv(tid) for tid in batch_ids])  # [B, 128]
+                            dev = next(cf_tower_model.parameters()).device
+                            enc = torch.nn.functional.normalize(
+                                cf_tower_model.track_tower(raw.float().to(dev)), p=2, dim=1
+                            ).cpu()  # [B, 32]
+                            all_vecs.append(enc)
+                    cf_tower_mat = torch.cat(all_vecs, dim=0)  # [N, 32]
+                    index.register_modality("cf_tower", cf_tower_mat)
+                    logger.info("CF-tower modality registered: %d tracks × 32-dim", cf_tower_mat.shape[0])
             except Exception as e:
                 logger.warning("CF tower load failed (%s)", e)
 
@@ -455,11 +477,13 @@ class MultiChannelRetrievalV2:
                 logger.warning("Profile tower channel failed: %s", e)
                 results["CH_Profile"] = []
 
-        if self.cf_tower_model is not None:
+        if self.cf_tower_model is not None and ctx.user_cf_emb is not None:
             try:
                 cf_t_k = cfg.topk_per_channel.get("CH_CF_Tower", 200)
-                cf_vec = self.cf_tower_model.encode_user(ctx.user_cf_emb)
-                results["CH_CF_Tower"] = self.index.topk("cf_bpr", cf_vec, cf_t_k)
+                cf_vec = self.cf_tower_model.encode_user(ctx.user_cf_emb)  # [32]
+                # Use pre-computed cf_tower modality (32-dim)
+                modality = "cf_tower" if self.index.has_modality("cf_tower") else "cf_bpr"
+                results["CH_CF_Tower"] = self.index.topk(modality, cf_vec, cf_t_k)
             except Exception as e:
                 logger.warning("CF tower channel failed: %s", e)
                 results["CH_CF_Tower"] = []
