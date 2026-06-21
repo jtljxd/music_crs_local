@@ -1,19 +1,27 @@
 """
 scripts/reranking/train_dcn_reranker.py
 ========================================
-Training script for DCNReranker (v4: truncate-concat + retrieval signals).
+Training script for DCNReranker v5.
 
-Loss: Listwise softmax CE with hard negatives from retrieval candidates.
+Key design decisions:
+  [P1] Listwise softmax CE loss (positive at index 0)
+  [P2] Hard negatives from retrieval candidates (same distribution as inference)
+  [P4] conv_goal replaced by pure goal_emb [1024→128]
+  [P5] Query embedding: strict per-turn key {sid}_{turn}_query, zero if absent
+  [P6] Feature extraction via shared functions in dcn_reranker.py
 
 Usage:
   python scripts/reranking/train_dcn_reranker.py \\
-      --query_emb_path     qwen/hist_conversation_embeddings_train_0.6b.pt \\
+      --query_emb_path     qwen/dialogue_embeddings_train_0.6b.pt \\
       --goal_emb_path      qwen/goal_embeddings_train_0.6b.pt \\
+      --val_query_emb_path qwen/dialogue_embeddings_test_0.6b.pt \\
+      --val_goal_emb_path  qwen/goal_embeddings_test_0.6b.pt \\
       --retrieval_path     qwen/retrieval_train_candidates.pt \\
+      --val_retrieval_path qwen/retrieval_test_candidates.pt \\
       --bge_tag_path       bge/track_tag_embeddings.pt \\
       --cache_dir          qwen/retrieval_indices \\
       --out                checkpoints/dcn_reranker_best.pt \\
-      --epochs 20 --batch_size 64 --num_neg 15 --lr 3e-4 \\
+      --epochs 30 --batch_size 64 --num_neg 15 --lr 3e-4 \\
       --device cuda
 """
 
@@ -29,7 +37,7 @@ import json
 import logging
 import math
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -45,59 +53,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _bucket_emb(value, n_bins: int, lo: float, hi: float) -> torch.Tensor:
-    t = torch.zeros(n_bins)
-    if value is None:
-        return t
-    v = float(value)
-    idx = int((v - lo) / (hi - lo + 1e-9) * n_bins)
-    t[max(0, min(n_bins - 1, idx))] = 1.0
-    return t
-
-
-def _get_track_embs(track_id: str, index) -> tuple:
-    """Return (audio[512], image[768], attr[1024], lyrics[1024], meta[1024])."""
-    def _gv(mod, dim):
-        v = index.get_vec(mod, track_id)
-        return v.float() if v is not None else torch.zeros(dim)
-    return (
-        _gv("audio",      512),
-        _gv("image",      768),
-        _gv("attributes", 1024),
-        _gv("lyrics",     1024),
-        _gv("metadata",   1024),
-    )
-
-
-def _get_track_context(
-    track_id: str,
-    track_meta: Dict,
-    bge_tag_store: Dict,
-    tag_proj: nn.Linear,
-    proj_device,
-) -> torch.Tensor:
-    """Build 137-dim context feature."""
-    bge_v = bge_tag_store.get(track_id, torch.zeros(384)).float()
-    with torch.no_grad():
-        tag32 = F.normalize(
-            tag_proj(bge_v.unsqueeze(0).to(proj_device)).squeeze(0), p=2, dim=0
-        ).cpu()
-    tm = track_meta.get(track_id, {})
-    log_pop    = torch.tensor([math.log1p(float(tm.get("popularity", 0) or 0))])
-    dur_bucket = _bucket_emb(tm.get("duration_ms"), 8, 30000, 600000)
-    return torch.cat([tag32, tag32, tag32, tag32, log_pop, dur_bucket])  # [137]
-
-
-def _get_track_cf(track_id: str, index) -> torch.Tensor:
-    v = index.get_vec("cf_bpr", track_id)
-    return v.float() if v is not None else torch.zeros(128)
-
-
 # ── Dataset ────────────────────────────────────────────────────────────────────
 
 class DCNDataset(Dataset):
+
     def __init__(
         self,
         samples:         List[dict],
@@ -109,8 +68,8 @@ class DCNDataset(Dataset):
         user_cf_store:   Dict[str, torch.Tensor],
         bge_tag_store:   Dict[str, torch.Tensor],
         tag_proj:        nn.Linear,
-        retrieval_store: Dict,           # {"{sid}_{turn}" → dict-of-channels or list}
-        all_track_ids:   List[str],
+        retrieval_store: Dict,       # {"{sid}_{turn}" → dict-of-channels or list}
+        all_track_ids:   List[str],  # fallback pool for random negatives
         num_neg:         int = 15,
     ):
         self.samples         = samples
@@ -128,39 +87,35 @@ class DCNDataset(Dataset):
 
     def __len__(self): return len(self.samples)
 
-    def _get_channel_results(self, sid: str, turn: int) -> Dict[str, List[str]]:
-        """Return per-channel dict for this (sid, turn), falling back to empty."""
-        for t in range(turn, -1, -1):
-            raw = self.retrieval_store.get(f"{sid}_{t}")
-            if raw is not None:
-                if isinstance(raw, dict):
-                    return raw
-                if isinstance(raw, list):
-                    return {"merged": raw}
-        return {}
+    def _get_merged_candidates(self, sid: str, turn: int) -> List[str]:
+        """Get merged retrieval list for (sid, turn). Tries exact key, else empty."""
+        raw = self.retrieval_store.get(f"{sid}_{turn}")
+        if raw is None:
+            return []
+        if isinstance(raw, dict):
+            return raw.get("merged", raw.get("union", []))
+        if isinstance(raw, list):
+            return raw
+        return []
 
-    def _sample_negatives(self, ch_results: Dict, gt_track: str) -> List[str]:
-        merged = ch_results.get("merged") or ch_results.get("union", [])
-        if not merged:
-            # flatten all channels
-            seen, merged = set(), []
-            for v in ch_results.values():
-                for tid in (v if isinstance(v, list) else []):
-                    if tid not in seen:
-                        seen.add(tid); merged.append(tid)
-        cands = [t for t in merged if t != gt_track]
-        if len(cands) >= self.num_neg:
-            return random.sample(cands, self.num_neg)
-        neg_ids = list(cands)
-        tried   = set(neg_ids) | {gt_track}
-        while len(neg_ids) < self.num_neg:
+    def _sample_negatives(self, candidates: List[str], gt_track: str) -> List[str]:
+        """[P2] Hard negatives from retrieval candidates, fallback to random."""
+        negs = [t for t in candidates if t != gt_track]
+        if len(negs) >= self.num_neg:
+            return random.sample(negs, self.num_neg)
+        # Fill with random from pool
+        tried = set(negs) | {gt_track}
+        while len(negs) < self.num_neg:
             c = random.choice(self.all_track_ids)
             if c not in tried:
-                neg_ids.append(c); tried.add(c)
-        return neg_ids
+                negs.append(c); tried.add(c)
+        return negs
 
     def __getitem__(self, idx: int) -> dict:
-        from mcrs.reranking_modules.dcn_reranker import build_retrieval_feat
+        from mcrs.reranking_modules.dcn_reranker import (
+            extract_query_emb, extract_goal_emb,
+            extract_user_profile, extract_track_features,
+        )
 
         s        = self.samples[idx]
         sid      = s["session_id"]
@@ -170,85 +125,58 @@ class DCNDataset(Dataset):
 
         proj_device = next(self.tag_proj.parameters()).device
 
-        # ── user_profile [86] ──────────────────────────────────────────────
-        um = self.user_meta.get(user_id, {})
-        age = um.get("age")
-        age_b = (_bucket_emb(math.log1p(float(age)), 16, 0, math.log1p(100))
-                 if age is not None else torch.zeros(16))
-        gender = torch.zeros(2)
-        if um.get("gender") == "male":    gender[0] = 1.0
-        elif um.get("gender") == "female": gender[1] = 1.0
-        user_profile = torch.cat([
-            age_b,
-            _bucket_emb(um.get("country_code_hash"),              16, 0, 1),
-            gender,
-            _bucket_emb(um.get("preferred_language_hash"),         4, 0, 1),
-            _bucket_emb(um.get("preferred_musical_culture_hash"), 32, 0, 1),
-            _bucket_emb(math.log1p(float(um.get("listen_count",  0) or 0)),
-                        8, 0, math.log1p(10000)),
-            _bucket_emb(math.log1p(float(um.get("session_count", 0) or 0)),
-                        8, 0, math.log1p(1000)),
-        ])  # [86]
+        # ── User features ──────────────────────────────────────────────────
+        user_profile = extract_user_profile(user_id, self.user_meta)   # [86]
+        ucf          = self.user_cf_store.get(user_id)
+        user_cf      = ucf.float() if ucf is not None else torch.zeros(128)
 
-        # ── user_cf [128] ──────────────────────────────────────────────────
-        ucf = self.user_cf_store.get(user_id)
-        user_cf = ucf.float() if ucf is not None else torch.zeros(128)
+        # [P4] Pure goal embedding — no padding junk
+        goal_emb  = extract_goal_emb(self.goal_store, sid)             # [1024]
 
-        # ── conv_goal [1036] ───────────────────────────────────────────────
-        ge = self.goal_store.get(sid)
-        ge = ge.float() if ge is not None else torch.zeros(1024)
-        conv_goal = torch.cat([torch.zeros(8), ge, torch.zeros(4)])  # [1036]
+        # [P5] Strict per-turn query key only
+        query_emb = extract_query_emb(self.query_store, sid, turn)     # [1024] or zeros
 
-        # ── query_emb [1024] ───────────────────────────────────────────────
-        q = self.query_store.get(f"{sid}_{turn}_query")
-        if q is None:
-            q = self.query_store.get(f"{sid}_{turn}")
-        query_emb = q.float() if q is not None else torch.zeros(1024)
+        # ── Retrieval candidates for hard negatives ────────────────────────
+        cands = self._get_merged_candidates(sid, turn)
+        neg_ids = self._sample_negatives(cands, gt_track)
 
-        # ── Retrieval channel results for this (sid, turn) ─────────────────
-        ch_results = self._get_channel_results(sid, turn)
+        # ── Track features ─────────────────────────────────────────────────
+        def _tfeat(tid):
+            return extract_track_features(
+                tid, self.index, self.track_meta,
+                self.bge_tag_store, self.tag_proj, proj_device,
+            )
 
-        # ── Positive track ─────────────────────────────────────────────────
-        pos_audio, pos_image, pos_attr, pos_lyrics, pos_meta_emb = _get_track_embs(gt_track, self.index)
-        pos_context = _get_track_context(gt_track, self.track_meta, self.bge_tag_store, self.tag_proj, proj_device)
-        pos_cf      = _get_track_cf(gt_track, self.index)
-        pos_ret     = build_retrieval_feat(gt_track, ch_results)
+        pa, pi, pattr, pl, pm, pctx, pcf = _tfeat(gt_track)
 
-        # ── Negative tracks [K, dim] ───────────────────────────────────────
-        neg_ids = self._sample_negatives(ch_results, gt_track)
-        neg_audio_l, neg_image_l, neg_attr_l = [], [], []
-        neg_lyrics_l, neg_meta_l, neg_ctx_l, neg_cf_l, neg_ret_l = [], [], [], [], []
-        for nid in neg_ids:
-            na, ni, nattr, nl, nm = _get_track_embs(nid, self.index)
-            neg_audio_l.append(na); neg_image_l.append(ni); neg_attr_l.append(nattr)
-            neg_lyrics_l.append(nl); neg_meta_l.append(nm)
-            neg_ctx_l.append(_get_track_context(nid, self.track_meta, self.bge_tag_store, self.tag_proj, proj_device))
-            neg_cf_l.append(_get_track_cf(nid, self.index))
-            neg_ret_l.append(build_retrieval_feat(nid, ch_results))
+        neg_feats = [_tfeat(nid) for nid in neg_ids]
+        neg_audio   = torch.stack([f[0] for f in neg_feats])   # [K, 512]
+        neg_image   = torch.stack([f[1] for f in neg_feats])   # [K, 768]
+        neg_attr    = torch.stack([f[2] for f in neg_feats])   # [K, 1024]
+        neg_lyrics  = torch.stack([f[3] for f in neg_feats])   # [K, 1024]
+        neg_meta    = torch.stack([f[4] for f in neg_feats])   # [K, 1024]
+        neg_context = torch.stack([f[5] for f in neg_feats])   # [K, 137]
+        neg_cf      = torch.stack([f[6] for f in neg_feats])   # [K, 128]
 
         return {
-            "user_profile": user_profile,
-            "user_cf":      user_cf,
-            "conv_goal":    conv_goal,
-            "query_emb":    query_emb,
-            # positive
-            "pos_audio":    pos_audio,
-            "pos_image":    pos_image,
-            "pos_attr":     pos_attr,
-            "pos_lyrics":   pos_lyrics,
-            "pos_meta_emb": pos_meta_emb,
-            "pos_context":  pos_context,
-            "pos_cf":       pos_cf,
-            "pos_ret_feat": pos_ret,
-            # negatives [K, dim]
-            "neg_audio":    torch.stack(neg_audio_l),
-            "neg_image":    torch.stack(neg_image_l),
-            "neg_attr":     torch.stack(neg_attr_l),
-            "neg_lyrics":   torch.stack(neg_lyrics_l),
-            "neg_meta_emb": torch.stack(neg_meta_l),
-            "neg_context":  torch.stack(neg_ctx_l),
-            "neg_cf":       torch.stack(neg_cf_l),
-            "neg_ret_feat": torch.stack(neg_ret_l),
+            "user_profile": user_profile,   # [86]
+            "user_cf":      user_cf,         # [128]
+            "goal_emb":     goal_emb,        # [1024]
+            "query_emb":    query_emb,       # [1024]
+            "pos_audio":    pa,              # [512]
+            "pos_image":    pi,              # [768]
+            "pos_attr":     pattr,           # [1024]
+            "pos_lyrics":   pl,              # [1024]
+            "pos_meta":     pm,              # [1024]
+            "pos_context":  pctx,            # [137]
+            "pos_cf":       pcf,             # [128]
+            "neg_audio":    neg_audio,
+            "neg_image":    neg_image,
+            "neg_attr":     neg_attr,
+            "neg_lyrics":   neg_lyrics,
+            "neg_meta":     neg_meta,
+            "neg_context":  neg_context,
+            "neg_cf":       neg_cf,
         }
 
 
@@ -261,8 +189,7 @@ def build_samples(conv_dataset_name: str, split: str) -> List[dict]:
     for item in ds:
         sid     = str(item.get("session_id") or item.get("id") or "")
         user_id = str(item.get("user_id", ""))
-        convs   = item.get("conversations", [])
-        for c in convs:
+        for c in item.get("conversations", []):
             if c.get("role") == "music" and c.get("content"):
                 samples.append({
                     "session_id":  sid,
@@ -274,12 +201,37 @@ def build_samples(conv_dataset_name: str, split: str) -> List[dict]:
     return samples
 
 
-# ── Training ───────────────────────────────────────────────────────────────────
+def _filter_samples(samples: List[dict], query_store: Dict,
+                    valid_tracks: set) -> List[dict]:
+    """
+    [P5] Keep only samples where:
+      1. gt_track is in the index
+      2. Strict per-turn query key exists: {sid}_{turn}_query
+    Log a summary so we know how many are missing.
+    """
+    kept, missing_query, missing_track = [], 0, 0
+    for s in samples:
+        if s["gt_track_id"] not in valid_tracks:
+            missing_track += 1
+            continue
+        k = f"{s['session_id']}_{s['turn_number']}_query"
+        if query_store.get(k) is None:
+            missing_query += 1
+            continue
+        kept.append(s)
+    logger.info("  Filtered: kept=%d  missing_track=%d  missing_query=%d",
+                len(kept), missing_track, missing_query)
+    return kept
 
-def _save(model, optimizer, scheduler, epoch, best_val_loss, history, path):
+
+# ── Checkpoint helpers ─────────────────────────────────────────────────────────
+
+def _save(model, tag_proj, optimizer, scheduler,
+          epoch, best_val_loss, history, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "state_dict":    model.state_dict(),
+        "tag_proj":      tag_proj.state_dict(),
         "optimizer":     optimizer.state_dict(),
         "scheduler":     scheduler.state_dict(),
         "epoch":         epoch,
@@ -287,6 +239,8 @@ def _save(model, optimizer, scheduler, epoch, best_val_loss, history, path):
         "history":       history,
     }, path)
 
+
+# ── Training ───────────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
     from datasets import load_dataset
@@ -308,8 +262,9 @@ def train(args: argparse.Namespace) -> None:
     )
     valid_tracks  = set(index.track_ids)
     all_track_ids = list(index.track_ids)
+    logger.info("Index: %d tracks", len(valid_tracks))
 
-    # ── Stores ────────────────────────────────────────────────────────────
+    # ── Embedding stores ──────────────────────────────────────────────────
     def _lpt(p, name):
         if p and os.path.exists(p):
             d = torch.load(p, map_location="cpu", weights_only=True)
@@ -323,12 +278,15 @@ def train(args: argparse.Namespace) -> None:
     retrieval_store = _lpt(args.retrieval_path,  "retrieval_store")
     bge_tag_store   = _lpt(args.bge_tag_path,   "bge_tag")
 
+    val_q = _lpt(args.val_query_emb_path, "val_query") if args.val_query_emb_path else {}
+    val_g = _lpt(args.val_goal_emb_path,  "val_goal")  if args.val_goal_emb_path  else {}
+    val_r = _lpt(args.val_retrieval_path, "val_ret")   if args.val_retrieval_path else {}
+
     # ── Metadata ──────────────────────────────────────────────────────────
     logger.info("Loading track metadata …")
     track_meta: Dict = {}
-    tm_ds = load_dataset(args.track_metadata_dataset)
-    for sp in tm_ds:
-        for row in tm_ds[sp]:
+    for sp, rows in load_dataset(args.track_metadata_dataset).items():
+        for row in rows:
             tid = str(row.get("track_id", ""))
             if tid:
                 track_meta[tid] = {"popularity": row.get("popularity"),
@@ -337,9 +295,8 @@ def train(args: argparse.Namespace) -> None:
     logger.info("Loading user metadata …")
     user_meta: Dict = {}
     try:
-        u_ds = load_dataset(args.user_metadata_dataset)
-        for sp in u_ds:
-            for row in u_ds[sp]:
+        for sp, rows in load_dataset(args.user_metadata_dataset).items():
+            for row in rows:
                 uid = str(row.get("user_id", ""))
                 if uid: user_meta[uid] = dict(row)
     except Exception as e:
@@ -348,9 +305,8 @@ def train(args: argparse.Namespace) -> None:
     logger.info("Loading user CF-BPR …")
     user_cf_store: Dict[str, torch.Tensor] = {}
     try:
-        ue_ds = load_dataset(args.user_emb_dataset)
-        for sp in ue_ds:
-            for row in ue_ds[sp]:
+        for sp, rows in load_dataset(args.user_emb_dataset).items():
+            for row in rows:
                 uid = str(row.get("user_id", ""))
                 v   = row.get("cf-bpr")
                 if uid and v is not None:
@@ -360,28 +316,21 @@ def train(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.warning("User CF: %s", e)
 
-    # ── Tag projection ────────────────────────────────────────────────────
+    # ── Tag projection (shared MLP 384→32) ───────────────────────────────
     tag_proj = nn.Linear(384, 32, bias=False).to(device)
 
     # ── Samples ───────────────────────────────────────────────────────────
-    def _filter(samples, q_store):
-        out = []
-        for s in samples:
-            if s["gt_track_id"] not in valid_tracks: continue
-            sid, t = s["session_id"], s["turn_number"]
-            if (q_store.get(f"{sid}_{t}_query") is not None
-                    or q_store.get(f"{sid}_{t}") is not None):
-                out.append(s)
-        return out
+    logger.info("Building train samples …")
+    train_raw = build_samples(args.conv_dataset, "train")
+    train_samples = _filter_samples(train_raw, query_store, valid_tracks)
 
-    train_samples = _filter(build_samples(args.conv_dataset, "train"), query_store)
+    val_samples: List[dict] = []
+    if val_q:
+        logger.info("Building val samples …")
+        val_raw = build_samples(args.conv_dataset, "test")
+        val_samples = _filter_samples(val_raw, val_q, valid_tracks)
 
-    val_q = _lpt(args.val_query_emb_path, "val_query") if args.val_query_emb_path else query_store
-    val_g = _lpt(args.val_goal_emb_path,  "val_goal")  if args.val_goal_emb_path  else goal_store
-    val_r = _lpt(args.val_retrieval_path, "val_ret")   if args.val_retrieval_path else retrieval_store
-
-    val_samples = _filter(build_samples(args.conv_dataset, "test"), val_q)
-    logger.info("Filtered → train=%d, val=%d", len(train_samples), len(val_samples))
+    logger.info("Final → train=%d, val=%d", len(train_samples), len(val_samples))
 
     def _make_ds(samples, q_store, g_store, r_store):
         return DCNDataset(
@@ -406,6 +355,7 @@ def train(args: argparse.Namespace) -> None:
         deep_dims=tuple(args.deep_dims),
         dropout=args.dropout,
     ).to(device)
+    logger.info("Model params: %d", model.count_params())
 
     params    = list(model.parameters()) + list(tag_proj.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -422,88 +372,64 @@ def train(args: argparse.Namespace) -> None:
         logger.info("Resuming from %s …", resume_path)
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["state_dict"])
-        if "optimizer"     in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler"     in ckpt: scheduler.load_state_dict(ckpt["scheduler"])
-        if "epoch"         in ckpt: start_epoch   = ckpt["epoch"] + 1
-        if "best_val_loss" in ckpt: best_val_loss = ckpt["best_val_loss"]
-        if "history"       in ckpt: history       = ckpt["history"]
+        if "tag_proj"     in ckpt: tag_proj.load_state_dict(ckpt["tag_proj"])
+        if "optimizer"    in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler"    in ckpt: scheduler.load_state_dict(ckpt["scheduler"])
+        if "epoch"        in ckpt: start_epoch   = ckpt["epoch"] + 1
+        if "best_val_loss"in ckpt: best_val_loss = ckpt["best_val_loss"]
+        if "history"      in ckpt: history       = ckpt["history"]
         logger.info("Resumed: epoch=%d, best_val_loss=%.4f", start_epoch, best_val_loss)
 
     random_baseline = math.log(1 + args.num_neg)
 
-    # ── Epochs ────────────────────────────────────────────────────────────
+    # ── Training loop ─────────────────────────────────────────────────────
+    def _run_batch(batch):
+        return model(
+            batch["user_profile"].to(device),
+            batch["user_cf"].to(device),
+            batch["goal_emb"].to(device),
+            batch["query_emb"].to(device),
+            batch["pos_audio"].to(device),
+            batch["pos_image"].to(device),
+            batch["pos_attr"].to(device),
+            batch["pos_lyrics"].to(device),
+            batch["pos_meta"].to(device),
+            batch["pos_context"].to(device),
+            batch["pos_cf"].to(device),
+            batch["neg_audio"].to(device),
+            batch["neg_image"].to(device),
+            batch["neg_attr"].to(device),
+            batch["neg_lyrics"].to(device),
+            batch["neg_meta"].to(device),
+            batch["neg_context"].to(device),
+            batch["neg_cf"].to(device),
+        )
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
         model.train(); tag_proj.train()
         train_losses = []
-
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False):
             optimizer.zero_grad()
-            loss = model(
-                batch["user_profile"].to(device),
-                batch["user_cf"].to(device),
-                batch["conv_goal"].to(device),
-                batch["query_emb"].to(device),
-                batch["pos_audio"].to(device),
-                batch["pos_image"].to(device),
-                batch["pos_attr"].to(device),
-                batch["pos_lyrics"].to(device),
-                batch["pos_meta_emb"].to(device),
-                batch["pos_context"].to(device),
-                batch["pos_cf"].to(device),
-                batch["pos_ret_feat"].to(device),
-                batch["neg_audio"].to(device),
-                batch["neg_image"].to(device),
-                batch["neg_attr"].to(device),
-                batch["neg_lyrics"].to(device),
-                batch["neg_meta_emb"].to(device),
-                batch["neg_context"].to(device),
-                batch["neg_cf"].to(device),
-                batch["neg_ret_feat"].to(device),
-            )
+            loss = _run_batch(batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
             train_losses.append(loss.item())
-
         scheduler.step()
         tr_l = sum(train_losses) / len(train_losses)
 
         if val_loader:
             model.eval(); tag_proj.eval()
-            val_losses = []
             with torch.no_grad():
-                for batch in val_loader:
-                    val_losses.append(model(
-                        batch["user_profile"].to(device),
-                        batch["user_cf"].to(device),
-                        batch["conv_goal"].to(device),
-                        batch["query_emb"].to(device),
-                        batch["pos_audio"].to(device),
-                        batch["pos_image"].to(device),
-                        batch["pos_attr"].to(device),
-                        batch["pos_lyrics"].to(device),
-                        batch["pos_meta_emb"].to(device),
-                        batch["pos_context"].to(device),
-                        batch["pos_cf"].to(device),
-                        batch["pos_ret_feat"].to(device),
-                        batch["neg_audio"].to(device),
-                        batch["neg_image"].to(device),
-                        batch["neg_attr"].to(device),
-                        batch["neg_lyrics"].to(device),
-                        batch["neg_meta_emb"].to(device),
-                        batch["neg_context"].to(device),
-                        batch["neg_cf"].to(device),
-                        batch["neg_ret_feat"].to(device),
-                    ).item())
-            vl_l = sum(val_losses) / len(val_losses)
-            logger.info("Epoch %d  train=%.4f  val=%.4f  (random_baseline=%.4f)",
+                vl_l = sum(_run_batch(b).item() for b in val_loader) / len(val_loader)
+            logger.info("Epoch %d  train=%.4f  val=%.4f  (baseline=%.4f)",
                         epoch, tr_l, vl_l, random_baseline)
             history.append({"epoch": epoch, "train_loss": tr_l, "val_loss": vl_l})
-
             if vl_l < best_val_loss:
                 best_val_loss = vl_l
                 patience_cnt  = 0
-                _save(model, optimizer, scheduler, epoch, best_val_loss, history, args.out)
+                _save(model, tag_proj, optimizer, scheduler,
+                      epoch, best_val_loss, history, args.out)
                 logger.info("  ✅ Saved epoch=%d val=%.4f → %s", epoch, vl_l, args.out)
             else:
                 patience_cnt += 1
@@ -514,7 +440,8 @@ def train(args: argparse.Namespace) -> None:
         else:
             logger.info("Epoch %d  train=%.4f  (no val)", epoch, tr_l)
             history.append({"epoch": epoch, "train_loss": tr_l})
-            _save(model, optimizer, scheduler, epoch, float("nan"), history, args.out)
+            _save(model, tag_proj, optimizer, scheduler,
+                  epoch, float("nan"), history, args.out)
 
     with open(args.out.replace(".pt", "_history.json"), "w") as f:
         json.dump(history, f, indent=2)
@@ -524,7 +451,7 @@ def train(args: argparse.Namespace) -> None:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train DCN-V2 Reranker (v4: trunc-concat + ret signals)")
+    p = argparse.ArgumentParser(description="Train DCN-V2 Reranker v5")
     p.add_argument("--conv_dataset",           default="talkpl-ai/TalkPlayData-Challenge-Dataset")
     p.add_argument("--track_emb_dataset",      default="talkpl-ai/TalkPlayData-Challenge-Track-Embeddings")
     p.add_argument("--track_metadata_dataset", default="talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
@@ -535,18 +462,19 @@ def parse_args():
     p.add_argument("--val_query_emb_path", default=None)
     p.add_argument("--val_goal_emb_path",  default=None)
     p.add_argument("--bge_tag_path",       default="bge/track_tag_embeddings.pt")
-    p.add_argument("--retrieval_path",     default=None)
+    p.add_argument("--retrieval_path",     default=None,
+                   help="Pre-computed retrieval candidates for train (hard negatives)")
     p.add_argument("--val_retrieval_path", default=None)
     p.add_argument("--cache_dir",          default="qwen/retrieval_indices")
     p.add_argument("--out",                default="checkpoints/dcn_reranker_best.pt")
-    p.add_argument("--epochs",       type=int,   default=20)
+    p.add_argument("--epochs",       type=int,   default=30)
     p.add_argument("--batch_size",   type=int,   default=64)
     p.add_argument("--num_neg",      type=int,   default=15)
     p.add_argument("--lr",           type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--dropout",      type=float, default=0.1)
     p.add_argument("--cross_layers", type=int,   default=3)
-    p.add_argument("--deep_dims",    type=int,   nargs="+", default=[512, 256, 128])
+    p.add_argument("--deep_dims",    type=int,   nargs="+", default=[256, 256, 128])
     p.add_argument("--patience",     type=int,   default=8)
     p.add_argument("--num_workers",  type=int,   default=0)
     p.add_argument("--resume",       default=None)
