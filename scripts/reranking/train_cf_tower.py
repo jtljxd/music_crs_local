@@ -119,14 +119,14 @@ def train(args: argparse.Namespace) -> None:
     device = args.device
 
     # ── Load user CF store ────────────────────────────────────────────────────
-    logger.info("Loading user CF-BPR embeddings from %s …", args.user_metadata_dataset)
+    logger.info("Loading user CF-BPR embeddings from %s …", args.user_emb_dataset)
     user_cf_store: Dict[str, torch.Tensor] = {}
     try:
-        u_ds = load_dataset(args.user_metadata_dataset)
+        u_ds = load_dataset(args.user_emb_dataset)
         for sn in u_ds:
             for row in u_ds[sn]:
                 uid = str(row.get("user_id", ""))
-                v   = row.get("user_cf-bpr")
+                v   = row.get("cf-bpr")
                 if uid and v is not None:
                     try:
                         t = torch.tensor(v, dtype=torch.float32)
@@ -248,8 +248,9 @@ def parse_args():
                    default="talkpl-ai/TalkPlayData-Challenge-Dataset")
     p.add_argument("--track_emb_dataset",      type=str,
                    default="talkpl-ai/TalkPlayData-Challenge-Track-Embeddings")
-    p.add_argument("--user_metadata_dataset",  type=str,
-                   default="talkpl-ai/TalkPlayData-Challenge-User-Metadata")
+    p.add_argument("--user_emb_dataset",        type=str,
+                   default="talkpl-ai/TalkPlayData-Challenge-User-Embeddings",
+                   help="HF dataset with user CF-BPR vectors (field: cf-bpr)")
     p.add_argument("--cache_dir",    type=str, default="qwen/retrieval_indices")
     p.add_argument("--out",          type=str, default="checkpoints/cf_tower_best.pt")
     p.add_argument("--epochs",       type=int,   default=50)

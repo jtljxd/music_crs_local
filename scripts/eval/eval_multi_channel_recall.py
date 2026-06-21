@@ -91,6 +91,7 @@ def evaluate(args: argparse.Namespace) -> None:
         track_emb_dataset   = args.track_emb_dataset,
         track_metadata_name = args.track_metadata_dataset,
         user_metadata_name  = args.user_metadata_dataset,
+        user_emb_dataset    = args.user_emb_dataset,
         split_types         = ["all_tracks"],
         cache_dir           = args.cache_dir,
         bge_tag_path        = args.bge_tag_path,
@@ -265,6 +266,9 @@ def parse_args() -> argparse.Namespace:
                    default="talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
     p.add_argument("--user_metadata_dataset", type=str,
                    default="talkpl-ai/TalkPlayData-Challenge-User-Metadata")
+    p.add_argument("--user_emb_dataset", type=str,
+                   default="talkpl-ai/TalkPlayData-Challenge-User-Embeddings",
+                   help="HF dataset with user CF-BPR embeddings (field: cf-bpr)")
     p.add_argument("--cache_dir", type=str, default="qwen/retrieval_indices")
     p.add_argument("--bge_tag_path", type=str,
                    default="bge/track_tag_embeddings.pt")

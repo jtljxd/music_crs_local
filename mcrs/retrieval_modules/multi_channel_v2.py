@@ -63,6 +63,8 @@ class MultiChannelConfig:
     track_emb_dataset:    str              = "talkpl-ai/TalkPlayData-Challenge-Track-Embeddings"
     track_metadata_name:  str              = "talkpl-ai/TalkPlayData-Challenge-Track-Metadata"
     user_metadata_name:   str              = "talkpl-ai/TalkPlayData-Challenge-User-Metadata"
+    # User-Embeddings dataset (contains cf-bpr vectors, separate from User-Metadata)
+    user_emb_dataset:     str              = "talkpl-ai/TalkPlayData-Challenge-User-Embeddings"
     split_types:          List[str]        = field(default_factory=lambda: ["all_tracks"])
     cache_dir:            str              = "qwen/retrieval_indices"
     bge_tag_path:         Optional[str]    = "bge/track_tag_embeddings.pt"
@@ -201,31 +203,24 @@ class MultiChannelRetrievalV2:
             logger.warning("Track metadata lookup build failed (%s) — CH20/21 disabled.", e)
 
         # User CF-BPR embeddings store (user_id → Tensor[128])
-        # These come from the user metadata dataset (if available)
+        # From talkpl-ai/TalkPlayData-Challenge-User-Embeddings, field "cf-bpr"
         user_cf_store: Dict[str, torch.Tensor] = {}
         try:
             from datasets import load_dataset as _load_ds2
-            logger.info("Building user CF-BPR store from %s …", cfg.user_metadata_name)
-            u_ds = _load_ds2(cfg.user_metadata_name)
+            logger.info("Building user CF-BPR store from %s …", cfg.user_emb_dataset)
+            u_ds = _load_ds2(cfg.user_emb_dataset)
             u_splits = list(u_ds.keys())
             from datasets import concatenate_datasets as _cat2
             u_all = _cat2([u_ds[s] for s in u_splits])
             loaded_cf = 0
-            # Log available column names on first row to help debug field name issues
-            _first_row = None
+            _logged_cols = False
             for row in u_all:
-                if _first_row is None:
-                    _first_row = row
-                    cf_cols = [k for k in row.keys() if "cf" in k.lower() or "bpr" in k.lower() or "embed" in k.lower()]
-                    logger.info("  User metadata columns (CF-related): %s", cf_cols)
-                    logger.info("  All columns: %s", list(row.keys())[:20])
+                if not _logged_cols:
+                    _logged_cols = True
+                    logger.info("  User-Embeddings columns: %s", list(row.keys())[:20])
                 uid = str(row.get("user_id", ""))
-                # Try multiple possible field names for CF-BPR embedding
-                cf_vec = (row.get("user_cf-bpr")
-                          or row.get("cf_bpr")
-                          or row.get("cf-bpr")
-                          or row.get("user_cf_bpr")
-                          or row.get("embedding"))
+                # Field is "cf-bpr" in TalkPlayData-Challenge-User-Embeddings
+                cf_vec = row.get("cf-bpr")
                 if uid and cf_vec is not None:
                     try:
                         t = torch.tensor(cf_vec, dtype=torch.float32)
@@ -443,7 +438,7 @@ class MultiChannelRetrievalV2:
         # ── Trained model channels (optional) ─────────────────────────────────
         if self.intent_model is not None:
             try:
-                intent_k = cfg.topk_per_channel.get("CH_Intent", 45)
+                intent_k = cfg.topk_per_channel.get("CH_Intent", 200)
                 intent_vec = self.intent_model.encode_query(ctx)
                 results["CH_Intent"] = self.index.topk("metadata", intent_vec, intent_k)
             except Exception as e:
@@ -452,7 +447,7 @@ class MultiChannelRetrievalV2:
 
         if self.profile_model is not None:
             try:
-                profile_k = cfg.topk_per_channel.get("CH_Profile", 30)
+                profile_k = cfg.topk_per_channel.get("CH_Profile", 200)
                 profile_vec = self.profile_model.encode_query(ctx)
                 results["CH_Profile"] = self.index.topk("metadata", profile_vec, profile_k)
             except Exception as e:
@@ -461,7 +456,7 @@ class MultiChannelRetrievalV2:
 
         if self.cf_tower_model is not None:
             try:
-                cf_t_k = cfg.topk_per_channel.get("CH_CF_Tower", 30)
+                cf_t_k = cfg.topk_per_channel.get("CH_CF_Tower", 200)
                 cf_vec = self.cf_tower_model.encode_user(ctx.user_cf_emb)
                 results["CH_CF_Tower"] = self.index.topk("cf_bpr", cf_vec, cf_t_k)
             except Exception as e:
@@ -476,7 +471,8 @@ class MultiChannelRetrievalV2:
                 if tid not in seen:
                     merged.append(tid)
                     seen.add(tid)
-        results["merged"] = merged[:topk] if len(merged) > topk else merged
+        # Keep ALL union candidates; callers (eval script) slice at their own K
+        results["merged"] = merged
 
         logger.debug(
             "Session %s turn %d: %d channels, %d merged candidates",
