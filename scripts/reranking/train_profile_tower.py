@@ -156,8 +156,9 @@ class ProfileTowerDataset(Dataset):
 
         # tag_avg, artist_avg, album_avg: project BGE [384] → [32]
         bge_v = self.bge_tag_store.get(track_id, torch.zeros(384)).float()
+        proj_device = next(self.tag_proj.parameters()).device
         with torch.no_grad():
-            tag32 = F.normalize(self.tag_proj(bge_v.unsqueeze(0)).squeeze(0), p=2, dim=0)
+            tag32 = F.normalize(self.tag_proj(bge_v.unsqueeze(0).to(proj_device)).squeeze(0), p=2, dim=0).cpu()
         # artist_avg and album_avg reuse tag projection as approximation
         artist32 = tag32.clone()
         album32  = tag32.clone()
