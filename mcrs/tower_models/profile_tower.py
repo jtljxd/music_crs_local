@@ -150,6 +150,26 @@ class ProfileTower(nn.Module):
                 year_emb, month_emb, weekday_emb,
             )
 
+    def encode_query(self, ctx) -> torch.Tensor:
+        """Inference from RetrievalContext (used by multi_channel_v2).
+        User metadata not available in ctx at inference time, use zeros.
+        """
+        dev = next(self.parameters()).device
+        def _z(*dims): return torch.zeros(1, *dims, device=dev)
+        age_emb     = _z(8)
+        country_emb = _z(16)
+        gender_emb  = _z(2)
+        lang_emb    = _z(4)
+        culture_emb = _z(32)
+        year_emb    = _z(8)
+        month_emb   = _z(4)
+        weekday_emb = _z(2)
+        return self.encode_profile(
+            age_emb, country_emb, gender_emb,
+            lang_emb, culture_emb,
+            year_emb, month_emb, weekday_emb,
+        ).squeeze(0)
+
     def encode_track(
         self,
         tag_avg: torch.Tensor, artist_avg: torch.Tensor, album_avg: torch.Tensor,

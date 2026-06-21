@@ -205,6 +205,19 @@ class IntentTower(nn.Module):
                 query_emb, goal_emb, category_emb, spec_emb, date_emb, profile_emb
             )
 
+    def encode_query(self, ctx) -> torch.Tensor:
+        """Inference from RetrievalContext (used by multi_channel_v2)."""
+        dev = next(self.parameters()).device
+        def _t(v, dim): return (v.float().unsqueeze(0).to(dev) if v is not None else torch.zeros(1, dim, device=dev))
+        query_emb   = _t(ctx.query_emb, 1024)
+        goal_emb    = _t(ctx.goal_emb,  1024)
+        # category / specificity / date / profile: not available in ctx, use zeros
+        category_emb = torch.zeros(1,  8, device=dev)
+        spec_emb     = torch.zeros(1, 16, device=dev)
+        date_emb     = torch.zeros(1, 14, device=dev)
+        profile_emb  = torch.zeros(1, 62, device=dev)
+        return self.encode_intent(query_emb, goal_emb, category_emb, spec_emb, date_emb, profile_emb).squeeze(0)
+
     def encode_track(
         self,
         metadata_emb:  torch.Tensor,
