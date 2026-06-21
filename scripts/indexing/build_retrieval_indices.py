@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to pre-computed BGE tag embeddings.",
     )
     p.add_argument(
+        "--bge_rich_path", type=str, default="bge/track_rich_embeddings.pt",
+        help="Path to pre-computed BGE rich track embeddings (name+artist+album+tags+date+duration+popularity).",
+    )
+    p.add_argument(
         "--cache_dir", type=str, default="qwen/retrieval_indices",
         help="Directory where the built index will be saved.",
     )
@@ -124,7 +128,8 @@ def main(args: argparse.Namespace) -> None:
         track_emb_dataset=args.track_emb_dataset,
         split_types=args.split_types,
         cache_dir=args.cache_dir,
-        bge_tag_path=args.bge_tag_path if os.path.exists(args.bge_tag_path or "") else None,
+        bge_tag_path=args.bge_tag_path   if os.path.exists(args.bge_tag_path  or "") else None,
+        bge_rich_path=args.bge_rich_path if os.path.exists(args.bge_rich_path or "") else None,
         device=args.device,
         force_rebuild=args.force_rebuild,
     )
