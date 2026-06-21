@@ -110,16 +110,20 @@ def build_track_features(
     bge_tag_store: Dict,
     tag_proj: nn.Linear,
     proj_device,
+    ch_results: Dict = None,
 ) -> tuple:
-    """Return (semantic[4352], context[137], cf[128])."""
+    """Return (audio[512], image[768], attr[1024], lyrics[1024], meta[1024], context[137], cf[128], ret[N_CH*2])."""
+    from mcrs.reranking_modules.dcn_reranker import build_retrieval_feat
+
     def _gv(mod, dim):
         v = index.get_vec(mod, track_id)
         return v.float() if v is not None else torch.zeros(dim)
 
-    semantic = torch.cat([
-        _gv("audio", 512), _gv("image", 768),
-        _gv("attributes", 1024), _gv("lyrics", 1024), _gv("metadata", 1024),
-    ])  # [4352]
+    audio    = _gv("audio",      512)
+    image    = _gv("image",      768)
+    attr     = _gv("attributes", 1024)
+    lyrics   = _gv("lyrics",     1024)
+    meta_emb = _gv("metadata",   1024)
 
     bge_v = bge_tag_store.get(track_id, torch.zeros(384)).float()
     with torch.no_grad():
@@ -134,7 +138,10 @@ def build_track_features(
 
     tcf = index.get_vec("cf_bpr", track_id)
     cf  = tcf.float() if tcf is not None else torch.zeros(128)
-    return semantic, context, cf
+
+    ret_feat = build_retrieval_feat(track_id, ch_results or {})
+
+    return audio, image, attr, lyrics, meta_emb, context, cf, ret_feat
 
 
 def score_candidates(
@@ -142,6 +149,7 @@ def score_candidates(
     user_profile, user_cf, conv_goal, query_emb_vec,
     cands: List[str],
     index, track_meta, bge_tag_store,
+    ch_results: Dict = None,
     score_batch_size: int = 512,
 ) -> List[tuple]:
     """Score all candidates, return sorted [(score, track_id)] descending."""
@@ -151,19 +159,24 @@ def score_candidates(
         for i in range(0, len(cands), score_batch_size):
             chunk = cands[i: i + score_batch_size]
             B = len(chunk)
-            t_sem, t_ctx, t_cf = zip(*[
-                build_track_features(tid, index, track_meta,
-                                     bge_tag_store, tag_proj, proj_device)
-                for tid in chunk
-            ])
+            feats = [build_track_features(tid, index, track_meta,
+                                          bge_tag_store, tag_proj, proj_device,
+                                          ch_results)
+                     for tid in chunk]
+            t_audio, t_image, t_attr, t_lyrics, t_meta, t_ctx, t_cf, t_ret = zip(*feats)
             sc = model.encode(
                 user_profile.expand(B, -1).to(device),
                 user_cf.expand(B, -1).to(device),
                 conv_goal.expand(B, -1).to(device),
                 query_emb_vec.expand(B, -1).to(device),
-                torch.stack(t_sem).to(device),
+                torch.stack(t_audio).to(device),
+                torch.stack(t_image).to(device),
+                torch.stack(t_attr).to(device),
+                torch.stack(t_lyrics).to(device),
+                torch.stack(t_meta).to(device),
                 torch.stack(t_ctx).to(device),
                 torch.stack(t_cf).to(device),
+                torch.stack(t_ret).to(device),
             ).squeeze(1).cpu()
             for tid, s in zip(chunk, sc.tolist()):
                 scored.append((s, tid))
@@ -317,12 +330,14 @@ def main(args: argparse.Namespace) -> None:
             total_turns += 1
 
             # ── Step 1: Multi-channel retrieval → top-500 ─────────────────
+            ch_results = {}
             try:
                 ctx       = retrieval.build_context(
                     session_id=session_id, turn_number=turn_number,
                     session_data=item, user_id=user_id,
                 )
                 ret_res   = retrieval.retrieve(ctx, topk=args.retrieval_topk)
+                ch_results = {k: v for k, v in ret_res.items()}  # keep per-channel info
                 cands     = [tid for tid in ret_res.get("merged", [])
                              if tid in valid_tracks]
             except Exception as e:
@@ -360,7 +375,8 @@ def main(args: argparse.Namespace) -> None:
                 model, tag_proj, device,
                 user_profile, user_cf_t, conv_goal, query_emb_vec,
                 cands, index, track_meta, bge_tag_store,
-                args.score_batch_size,
+                ch_results=ch_results,
+                score_batch_size=args.score_batch_size,
             )
             reranked = [tid for _, tid in scored]
 

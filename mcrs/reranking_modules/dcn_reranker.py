@@ -3,51 +3,82 @@ mcrs/reranking_modules/dcn_reranker.py
 =======================================
 DCN-V2 Reranker for music CRS.
 
-Feature towers (each → 128-dim):
+Feature design:
+  All embedding features are truncated to 128-dim directly (no large MLP encoders).
+  Scalar/categorical features are projected to 128-dim via a small MLP.
+
   User side:
-    user_profile  : age_log_bucket + country16 + gender2 + language4 + culture32
-                    → MLP(86 → 128)
-    user_cf       : raw CF-BPR 128-dim (passed through)
-    conv_goal     : category8 + listener_goal_emb1024 + specificity4
-                    → MLP(1036 → 128)
-    query         : current-turn query emb 1024 → MLP(1024 → 128)
+    user_profile  [86→128]   : age_bucket+country+gender+lang+culture+listen+session → MLP
+    user_cf       [128]      : raw CF-BPR (truncated/padded to 128)
+    conv_goal     [1036→128] : category8 + goal_emb[:120] + specificity4 → truncate & MLP
+    query_emb     [128]      : current-turn dialogue emb[:128]
 
   Track side:
-    track_semantic: CLAP512 + SigLIP768 + attr1024 + lyrics1024 + meta1024
-                    → MLP(4352 → 128)
-    track_context : ISRC32 + tag32 + artist32 + album32 + log_pop1 + dur_bucket8
-                    → MLP(137 → 128)   # see NOTE below
-    track_cf      : raw CF-BPR 128-dim (passed through)
+    track_audio   [128]      : CLAP[:128]
+    track_image   [128]      : SigLIP[:128]
+    track_text    [128]      : mean(attr[:128], lyrics[:128], meta[:128])
+    track_context [128]      : MLP(ISRC32+tag32+artist32+album32+logpop1+dur8 → 128)
+    track_cf      [128]      : raw CF-BPR[:128]
 
-NOTE on track_context dims:
-  ISRC32 + tag32 + artist32 + album32 = 128
-  log(pop) scalar = 1  →  total scalar features alongside buckets
-  duration_bucket8 = 8
-  → concat dim = 128 + 1 + 8 = 137   (the spec says 200→128, we follow exact dims)
+  Retrieval signals:
+    retrieval_feat [N_CH*2]  : for each channel: (hit_i, norm_rank_i)
+                               hit=1 if track in channel, norm_rank = 1-rank/topk (0 if not hit)
+                               N_CH = 23 → 46-dim
 
-All 7 towers concatenated → 896-dim input to DCN-V2.
-
-DCN-V2 architecture (3 cross layers + 3 deep layers in parallel):
-  Cross branch: x0 ⊙ (W_i x_i + b_i) + x_i   (bilinear cross)
-  Deep branch:  3-layer MLP with ReLU + LayerNorm + Dropout
-  Merge: concat(cross_out, deep_out) → Linear(896+896, 256) → Linear(256, 1)
+  Total = 9×128 + 46 = 1198 → DCN-V2(3 cross + 3 deep) → MLP(128→32→1)
 """
 
 from __future__ import annotations
 
 import math
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Channel registry (must match MultiChannelRetrievalV2 order) ───────────────
+# Keep in sync with direct_channels.py DIRECT_CHANNELS + CH23_BM25
+ALL_CHANNELS: List[str] = [
+    "CH01_CF_BPR",
+    "CH02_Query_Meta",
+    "CH03_Query_Lyrics",
+    "CH04_Query_Attributes",
+    "CH05_Goal_Meta",
+    "CH06_Goal_Lyrics",
+    "CH07_Goal_Attributes",
+    "CH08_Pos_Sem",
+    "CH09_Neg_Correct",
+    "CH10_Query_Delta",
+    "CH11_Last_Audio",
+    "CH12_Last_Image",
+    "CH13_Last_Meta",
+    "CH14_Last_Lyrics",
+    "CH15_Pos_Audio",
+    "CH16_Pos_Image",
+    "CH17_Pos_Meta",
+    "CH18_Pos_Lyrics",
+    "CH19_Pos_Attributes",
+    "CH20_Artist_Expand",
+    "CH21_Album_Expand",
+    "CH22_BGE_Genre_Decade",
+    "CH23_BM25",
+]
+N_CHANNELS = len(ALL_CHANNELS)   # 23
+CH_IDX     = {ch: i for i, ch in enumerate(ALL_CHANNELS)}
+
+EMB_DIM    = 128
+N_USER     = 4   # user_profile, user_cf, conv_goal, query_emb
+N_TRACK    = 5   # track_audio, track_image, track_text, track_context, track_cf
+CONCAT_DIM = (N_USER + N_TRACK) * EMB_DIM + N_CHANNELS * 2  # 9×128 + 46 = 1198
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _mlp(in_dim: int, hidden_dims, out_dim: int,
-         dropout: float = 0.2) -> nn.Sequential:
+         dropout: float = 0.1) -> nn.Sequential:
     layers = []
     prev = in_dim
     for h in hidden_dims:
@@ -57,128 +88,49 @@ def _mlp(in_dim: int, hidden_dims, out_dim: int,
     return nn.Sequential(*layers)
 
 
-def _bucket_emb(val, n_buckets: int, lo: float, hi: float) -> torch.Tensor:
-    """Soft one-hot bucket embedding (1-D, no batch)."""
-    t = torch.zeros(n_buckets)
-    if val is None:
+def _trunc_pad(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """Truncate or zero-pad last dimension to `dim`."""
+    d = t.shape[-1]
+    if d >= dim:
+        return t[..., :dim]
+    return F.pad(t, (0, dim - d))
+
+
+def _bucket_emb(value, n_bins: int, lo: float, hi: float) -> torch.Tensor:
+    t = torch.zeros(n_bins)
+    if value is None:
         return t
-    v = float(val)
-    idx = int((v - lo) / (hi - lo + 1e-9) * n_buckets)
-    idx = max(0, min(n_buckets - 1, idx))
-    t[idx] = 1.0
+    v = float(value)
+    idx = int((v - lo) / (hi - lo + 1e-9) * n_bins)
+    t[max(0, min(n_bins - 1, idx))] = 1.0
     return t
 
 
-# ── Feature towers ────────────────────────────────────────────────────────────
+# ── Small feature encoders ─────────────────────────────────────────────────────
 
-class UserProfileTower(nn.Module):
-    """age_log_bucket(16) + country(16) + gender(2) + language(4) + culture(32)
-    + log_age_scalar(1) + listen_count_bucket(8) + session_count_bucket(7)
-    Total raw = 86  → MLP(86 → 128)
-    """
-    IN_DIM  = 86
-    OUT_DIM = 128
-
-    def __init__(self, dropout: float = 0.2):
+class UserProfileEncoder(nn.Module):
+    """86-dim categorical features → 128."""
+    def __init__(self, dropout: float = 0.1):
         super().__init__()
-        self.net = _mlp(self.IN_DIM, [256, 192], self.OUT_DIM, dropout)
+        self.net = _mlp(86, [128], EMB_DIM, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 86]
-        return F.normalize(self.net(x), p=2, dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x.float()), p=2, dim=-1)
 
 
-class UserCFTower(nn.Module):
-    """Pass-through for raw 128-dim CF-BPR user embedding."""
-    OUT_DIM = 128
-
-    def __init__(self):
+class TrackContextEncoder(nn.Module):
+    """ISRC32+tag32+artist32+album32+logpop1+dur8 = 137 → 128."""
+    def __init__(self, dropout: float = 0.1):
         super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(128, 128), nn.LayerNorm(128), nn.ReLU()
-        )
+        self.net = _mlp(137, [128], EMB_DIM, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 128]
-        return F.normalize(self.proj(x), p=2, dim=1)
-
-
-class ConvGoalTower(nn.Module):
-    """category(8) + listener_goal_emb(1024) + specificity(4)
-    → MLP(1036 → 128)
-    """
-    IN_DIM  = 1036
-    OUT_DIM = 128
-
-    def __init__(self, dropout: float = 0.2):
-        super().__init__()
-        self.net = _mlp(self.IN_DIM, [512, 256], self.OUT_DIM, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 1036]
-        return F.normalize(self.net(x), p=2, dim=1)
-
-
-class QueryTower(nn.Module):
-    """Current-turn query embedding 1024 → MLP(1024 → 128)."""
-    IN_DIM  = 1024
-    OUT_DIM = 128
-
-    def __init__(self, dropout: float = 0.2):
-        super().__init__()
-        self.net = _mlp(self.IN_DIM, [512, 256], self.OUT_DIM, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 1024]
-        return F.normalize(self.net(x), p=2, dim=1)
-
-
-class TrackSemanticTower(nn.Module):
-    """CLAP(512) + SigLIP(768) + attr(1024) + lyrics(1024) + meta(1024)
-    → MLP(4352 → 128)
-    """
-    IN_DIM  = 4352
-    OUT_DIM = 128
-
-    def __init__(self, dropout: float = 0.2):
-        super().__init__()
-        self.net = _mlp(self.IN_DIM, [1024, 512, 256], self.OUT_DIM, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 4352]
-        return F.normalize(self.net(x), p=2, dim=1)
-
-
-class TrackContextTower(nn.Module):
-    """ISRC(32) + tag(32) + artist(32) + album(32) + log_pop(1) + dur_bucket(8)
-    = 137 → MLP(137 → 128)
-    """
-    IN_DIM  = 137
-    OUT_DIM = 128
-
-    def __init__(self, dropout: float = 0.2):
-        super().__init__()
-        self.net = _mlp(self.IN_DIM, [256, 192], self.OUT_DIM, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 137]
-        return F.normalize(self.net(x), p=2, dim=1)
-
-
-class TrackCFTower(nn.Module):
-    """Pass-through for raw 128-dim CF-BPR track embedding."""
-    OUT_DIM = 128
-
-    def __init__(self):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(128, 128), nn.LayerNorm(128), nn.ReLU()
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, 128]
-        return F.normalize(self.proj(x), p=2, dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x.float()), p=2, dim=-1)
 
 
 # ── DCN-V2 ────────────────────────────────────────────────────────────────────
 
 class CrossLayer(nn.Module):
-    """One DCN-V2 cross layer (bilinear interaction):
-        x_{l+1} = x_0 ⊙ (W_l · x_l + b_l) + x_l
-    """
     def __init__(self, dim: int):
         super().__init__()
         self.W = nn.Linear(dim, dim, bias=True)
@@ -188,26 +140,10 @@ class CrossLayer(nn.Module):
 
 
 class DCNV2(nn.Module):
-    """DCN-V2 with parallel cross + deep stack.
-
-    Args:
-        in_dim      : input feature dimension (sum of all tower outputs)
-        cross_layers: number of cross layers
-        deep_dims   : hidden sizes for the deep MLP branch
-        dropout     : dropout rate in deep branch
-    """
-    def __init__(
-        self,
-        in_dim:       int   = 896,
-        cross_layers: int   = 3,
-        deep_dims           = (512, 256, 128),
-        dropout:      float = 0.2,
-    ):
+    def __init__(self, in_dim: int = CONCAT_DIM, cross_layers: int = 3,
+                 deep_dims=(512, 256, 128), dropout: float = 0.1):
         super().__init__()
-        # Cross branch
         self.cross = nn.ModuleList([CrossLayer(in_dim) for _ in range(cross_layers)])
-
-        # Deep branch
         deep_layers = []
         prev = in_dim
         for h in deep_dims:
@@ -215,205 +151,204 @@ class DCNV2(nn.Module):
             prev = h
         self.deep = nn.Sequential(*deep_layers)
         self.deep_out_dim = prev
-
-        # Final projection: concat(cross_out, deep_out) → MLP(128→32→1)
-        self.output = nn.Sequential(
-            nn.Linear(in_dim + self.deep_out_dim, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 32),
-            nn.ReLU(),
+        # Final head: concat(cross, deep) → MLP(128→32→1)
+        merge = in_dim + self.deep_out_dim
+        self.head = nn.Sequential(
+            nn.Linear(merge, 128), nn.LayerNorm(128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 32), nn.ReLU(),
             nn.Linear(32, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:   # [B, in_dim] → [B, 1]
-        # Cross branch
-        x0 = x
-        xc = x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0, xc = x, x
         for layer in self.cross:
-            xc = layer(x0, xc)              # [B, in_dim]
-
-        # Deep branch
-        xd = self.deep(x)                   # [B, deep_out_dim]
-
-        # Merge and score
-        merged = torch.cat([xc, xd], dim=1)  # [B, in_dim + deep_out_dim]
-        return self.output(merged)            # [B, 1]
+            xc = layer(x0, xc)
+        xd = self.deep(x)
+        return self.head(torch.cat([xc, xd], dim=1))
 
 
-# ── Full reranker model ───────────────────────────────────────────────────────
-
-TOWER_DIM = 128
-N_TOWERS  = 7
-CONCAT_DIM = TOWER_DIM * N_TOWERS  # 896
-
+# ── Full reranker ──────────────────────────────────────────────────────────────
 
 class DCNReranker(nn.Module):
-    """Full DCN-V2 reranker.
-
-    Input: raw feature dicts (see forward signature).
-    Output: scalar relevance score per (user, track) pair.
+    """
+    Inputs
+    ------
+    user_profile    : [B, 86]
+    user_cf         : [B, 128+]  (will be truncated to 128)
+    conv_goal       : [B, 1036]  (goal_emb will be truncated)
+    query_emb       : [B, 1024+] (will be truncated to 128)
+    track_audio     : [B, 512+]  CLAP (truncated to 128)
+    track_image     : [B, 768+]  SigLIP (truncated to 128)
+    track_attr      : [B, 1024+] attributes (truncated to 128)
+    track_lyrics    : [B, 1024+] (truncated to 128)
+    track_meta_emb  : [B, 1024+] metadata emb (truncated to 128)
+    track_context   : [B, 137]   ISRC+tag+artist+album+pop+dur → MLP → 128
+    track_cf        : [B, 128+]  (truncated to 128)
+    retrieval_feat  : [B, N_CH*2]  hit + norm_rank per channel
     """
 
-    def __init__(
-        self,
-        cross_layers: int   = 3,
-        deep_dims           = (512, 256, 128),
-        dropout:      float = 0.2,
-    ):
+    def __init__(self, cross_layers: int = 3,
+                 deep_dims=(512, 256, 128), dropout: float = 0.1):
         super().__init__()
-        # Feature towers
-        self.user_profile_tower  = UserProfileTower(dropout)
-        self.user_cf_tower       = UserCFTower()
-        self.conv_goal_tower     = ConvGoalTower(dropout)
-        self.query_tower         = QueryTower(dropout)
-        self.track_semantic_tower = TrackSemanticTower(dropout)
-        self.track_context_tower  = TrackContextTower(dropout)
-        self.track_cf_tower       = TrackCFTower()
+        self.user_profile_enc = UserProfileEncoder(dropout)
+        self.track_context_enc = TrackContextEncoder(dropout)
+        self.dcn = DCNV2(CONCAT_DIM, cross_layers, deep_dims, dropout)
 
-        # DCN-V2
-        self.dcn = DCNV2(
-            in_dim=CONCAT_DIM,
-            cross_layers=cross_layers,
-            deep_dims=deep_dims,
-            dropout=dropout,
-        )
-
-    def encode(
+    def _encode_features(
         self,
         user_profile:   torch.Tensor,   # [B, 86]
-        user_cf:        torch.Tensor,   # [B, 128]
+        user_cf:        torch.Tensor,   # [B, ≥128]
         conv_goal:      torch.Tensor,   # [B, 1036]
-        query_emb:      torch.Tensor,   # [B, 1024]
-        track_semantic: torch.Tensor,   # [B, 4352]
+        query_emb:      torch.Tensor,   # [B, ≥128]
+        track_audio:    torch.Tensor,   # [B, ≥128]  CLAP
+        track_image:    torch.Tensor,   # [B, ≥128]  SigLIP
+        track_attr:     torch.Tensor,   # [B, ≥128]
+        track_lyrics:   torch.Tensor,   # [B, ≥128]
+        track_meta_emb: torch.Tensor,   # [B, ≥128]
         track_context:  torch.Tensor,   # [B, 137]
-        track_cf:       torch.Tensor,   # [B, 128]
-    ) -> torch.Tensor:                  # [B, 1]  raw score (logit)
-        """Encode all features and return raw relevance logit."""
-        u_prof  = self.user_profile_tower(user_profile.float())
-        u_cf    = self.user_cf_tower(user_cf.float())
-        u_goal  = self.conv_goal_tower(conv_goal.float())
-        u_query = self.query_tower(query_emb.float())
-        t_sem   = self.track_semantic_tower(track_semantic.float())
-        t_ctx   = self.track_context_tower(track_context.float())
-        t_cf    = self.track_cf_tower(track_cf.float())
-        feat = torch.cat([u_prof, u_cf, u_goal, u_query,
-                          t_sem, t_ctx, t_cf], dim=1)   # [B, 896]
-        return self.dcn(feat)                             # [B, 1]
+        track_cf:       torch.Tensor,   # [B, ≥128]
+        retrieval_feat: torch.Tensor,   # [B, N_CH*2]
+    ) -> torch.Tensor:                  # [B, CONCAT_DIM]
+
+        # User features
+        u_prof  = self.user_profile_enc(user_profile)               # [B, 128]
+        u_cf    = F.normalize(_trunc_pad(user_cf.float(),  128), p=2, dim=-1)
+        # conv_goal: use category8 + goal_emb[:112] + specificity4 = 8+112+4=124→pad to 128
+        cg_cat  = conv_goal[:, :8]
+        cg_goal = conv_goal[:, 8:8+112]    # first 112 dims of goal_emb
+        cg_spec = conv_goal[:, 1032:1036]
+        u_goal  = F.normalize(_trunc_pad(
+            torch.cat([cg_cat, cg_goal, cg_spec], dim=1).float(), 128
+        ), p=2, dim=-1)
+        u_query = F.normalize(_trunc_pad(query_emb.float(), 128), p=2, dim=-1)
+
+        # Track features
+        t_audio  = F.normalize(_trunc_pad(track_audio.float(),    128), p=2, dim=-1)
+        t_image  = F.normalize(_trunc_pad(track_image.float(),    128), p=2, dim=-1)
+        # text: mean of attr, lyrics, meta (each truncated to 128)
+        t_text   = F.normalize(
+            (_trunc_pad(track_attr.float(),    128)
+             + _trunc_pad(track_lyrics.float(), 128)
+             + _trunc_pad(track_meta_emb.float(), 128)) / 3.0,
+            p=2, dim=-1
+        )
+        t_ctx    = self.track_context_enc(track_context)            # [B, 128]
+        t_cf     = F.normalize(_trunc_pad(track_cf.float(),    128), p=2, dim=-1)
+
+        # Retrieval signals (already float, normalized externally)
+        ret      = retrieval_feat.float()                           # [B, 46]
+
+        return torch.cat([
+            u_prof, u_cf, u_goal, u_query,
+            t_audio, t_image, t_text, t_ctx, t_cf,
+            ret,
+        ], dim=1)  # [B, CONCAT_DIM]
+
+    def encode(self, *args) -> torch.Tensor:
+        """Inference: single forward → [B, 1] score."""
+        feat = self._encode_features(*args)
+        return self.dcn(feat)
 
     def forward(
         self,
-        # ── User features (shared across all tracks in batch) ─────────────
-        user_profile:   torch.Tensor,   # [B, 86]
-        user_cf:        torch.Tensor,   # [B, 128]
-        conv_goal:      torch.Tensor,   # [B, 1036]
-        query_emb:      torch.Tensor,   # [B, 1024]
-        # ── Track features (positive sample) ─────────────────────────────
-        track_semantic: torch.Tensor,   # [B, 4352]
-        track_context:  torch.Tensor,   # [B, 137]
-        track_cf:       torch.Tensor,   # [B, 128]
-    ) -> dict:
-        """Training forward with in-batch softmax loss.
-
-        Each sample (query_i, track_i) is a positive pair.
-        The B-1 other tracks in the batch serve as negatives.
-
-        Computes:
-          score_matrix[i, j] = score(user_i, track_j)   shape [B, B]
-          loss = mean CrossEntropy(score_matrix, diag_labels)
-        Returns dict with 'loss' and 'scores'.
+        # User features
+        user_profile:   torch.Tensor,
+        user_cf:        torch.Tensor,
+        conv_goal:      torch.Tensor,
+        query_emb:      torch.Tensor,
+        # Positive track features
+        pos_audio:      torch.Tensor,
+        pos_image:      torch.Tensor,
+        pos_attr:       torch.Tensor,
+        pos_lyrics:     torch.Tensor,
+        pos_meta_emb:   torch.Tensor,
+        pos_context:    torch.Tensor,
+        pos_cf:         torch.Tensor,
+        pos_ret_feat:   torch.Tensor,   # [B, N_CH*2]
+        # Negative track features [B, K, dim]
+        neg_audio:      torch.Tensor,
+        neg_image:      torch.Tensor,
+        neg_attr:       torch.Tensor,
+        neg_lyrics:     torch.Tensor,
+        neg_meta_emb:   torch.Tensor,
+        neg_context:    torch.Tensor,
+        neg_cf:         torch.Tensor,
+        neg_ret_feat:   torch.Tensor,   # [B, K, N_CH*2]
+    ) -> torch.Tensor:
+        """Training forward: listwise softmax CE, label=0 (positive first).
+        Returns scalar loss.
         """
         B = user_profile.size(0)
+        K = neg_audio.size(1)
 
-        # ── Encode user context (same for all tracks of this query) ───────
-        u_prof  = self.user_profile_tower(user_profile.float())   # [B, 128]
-        u_cf    = self.user_cf_tower(user_cf.float())
-        u_goal  = self.conv_goal_tower(conv_goal.float())
-        u_query = self.query_tower(query_emb.float())
-        user_feat = torch.cat([u_prof, u_cf, u_goal, u_query], dim=1)  # [B, 512]
+        pos_feat = self._encode_features(
+            user_profile, user_cf, conv_goal, query_emb,
+            pos_audio, pos_image, pos_attr, pos_lyrics, pos_meta_emb,
+            pos_context, pos_cf, pos_ret_feat,
+        )
+        pos_score = self.dcn(pos_feat)   # [B, 1]
 
-        # ── Encode all tracks in batch ────────────────────────────────────
-        t_sem = self.track_semantic_tower(track_semantic.float())   # [B, 128]
-        t_ctx = self.track_context_tower(track_context.float())
-        t_cf  = self.track_cf_tower(track_cf.float())
-        track_feat = torch.cat([t_sem, t_ctx, t_cf], dim=1)         # [B, 384]
+        # Flatten negatives
+        def _fl(t): return t.reshape(B * K, -1)
+        def _ex(t): return t.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
 
-        # ── Build [B, B] score matrix via in-batch pairing ────────────────
-        # For user i paired with track j:
-        #   feat_ij = concat(user_feat[i], track_feat[j])  [896]
-        user_exp  = user_feat.unsqueeze(1).expand(B, B, -1)   # [B, B, 512]
-        track_exp = track_feat.unsqueeze(0).expand(B, B, -1)  # [B, B, 384]
-        pair_feat = torch.cat([user_exp, track_exp], dim=2)   # [B, B, 896]
-        pair_feat_flat = pair_feat.reshape(B * B, 896)        # [B*B, 896]
+        neg_feat = self._encode_features(
+            _ex(user_profile), _ex(user_cf), _ex(conv_goal), _ex(query_emb),
+            _fl(neg_audio), _fl(neg_image), _fl(neg_attr),
+            _fl(neg_lyrics), _fl(neg_meta_emb),
+            _fl(neg_context), _fl(neg_cf), _fl(neg_ret_feat),
+        )
+        neg_score = self.dcn(neg_feat).reshape(B, K)   # [B, K]
 
-        scores_flat = self.dcn(pair_feat_flat)                 # [B*B, 1]
-        score_matrix = scores_flat.reshape(B, B)               # [B, B]
+        logits = torch.cat([pos_score, neg_score], dim=1)   # [B, 1+K]
+        labels = torch.zeros(B, dtype=torch.long, device=logits.device)
+        return F.cross_entropy(logits, labels)
 
-        # ── In-batch softmax cross-entropy ───────────────────────────────
-        # label[i] = i  (diagonal = positive)
-        labels = torch.arange(B, device=score_matrix.device)
-        loss = F.cross_entropy(score_matrix, labels)
-
-        # Softmax probabilities (for monitoring)
-        probs = torch.softmax(score_matrix, dim=1)             # [B, B]
-
-        return {
-            "loss":         loss,
-            "score_matrix": score_matrix,
-            "probs":        probs,
-        }
-
-    # ── Persistence ───────────────────────────────────────────────────────────
+    # ── Persistence ────────────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save({"state_dict": self.state_dict()}, path)
-        
+
     @classmethod
     def load(cls, path: str, device: str = "cpu",
              cross_layers: int = 3,
-             deep_dims = (512, 256, 128),
-             dropout: float = 0.2) -> "DCNReranker":
-        ckpt = torch.load(path, map_location=device, weights_only=True)
+             deep_dims=(512, 256, 128),
+             dropout: float = 0.1) -> "DCNReranker":
+        ckpt  = torch.load(path, map_location=device, weights_only=False)
         model = cls(cross_layers=cross_layers, deep_dims=deep_dims, dropout=dropout)
-        model.load_state_dict(ckpt["state_dict"])
-        model.eval()
-        return model.to(device)
+        model.load_state_dict(ckpt.get("state_dict", ckpt))
+        return model.eval().to(device)
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-# ── Feature builder helpers (for inference/training) ─────────────────────────
+# ── Retrieval feature builder ──────────────────────────────────────────────────
 
-def build_user_profile_vec(user_meta: dict) -> torch.Tensor:
-    """Build [86] user profile feature vector from metadata dict."""
-    # age: log-bucket into 16 bins (ages 0-100, log scale)
-    age = user_meta.get("age")
-    if age is not None:
-        log_age = math.log1p(float(age))
-        age_bucket = _bucket_emb(log_age, 16, 0, math.log1p(100))
-    else:
-        age_bucket = torch.zeros(16)
-
-    country_emb = _bucket_emb(user_meta.get("country_code_hash"), 16, 0, 1)
-
-    gender_emb = torch.zeros(2)
-    g = user_meta.get("gender", "")
-    if g == "male":   gender_emb[0] = 1.0
-    elif g == "female": gender_emb[1] = 1.0
-
-    lang_emb    = _bucket_emb(user_meta.get("preferred_language_hash"), 4, 0, 1)
-    culture_emb = _bucket_emb(user_meta.get("preferred_musical_culture_hash"), 32, 0, 1)
-
-    listen_count = _bucket_emb(
-        math.log1p(float(user_meta.get("listen_count", 0) or 0)), 8, 0, math.log1p(10000)
-    )
-    session_count = _bucket_emb(
-        math.log1p(float(user_meta.get("session_count", 0) or 0)), 8, 0, math.log1p(1000)
-    )
-
-    return torch.cat([age_bucket, country_emb, gender_emb,
-                      lang_emb, culture_emb,
-                      listen_count, session_count])  # 16+16+2+4+32+8+8 = 86
+def build_retrieval_feat(
+    track_id: str,
+    per_channel_results: Dict[str, List[str]],
+    topk_per_channel: int = 200,
+) -> torch.Tensor:
+    """
+    Build a [N_CH * 2] tensor for one track:
+      [hit_0, rank_0, hit_1, rank_1, ..., hit_22, rank_22]
+    hit_i    = 1.0 if track_id appears in channel i's result list, else 0.0
+    rank_i   = 1 - (rank / topk_per_channel) if hit, else 0.0
+               (higher = better rank, 1.0 = rank-1, 0.0 = not retrieved)
+    """
+    feat = torch.zeros(N_CHANNELS * 2)
+    for ch_name, cands in per_channel_results.items():
+        if ch_name == "merged":
+            continue
+        idx = CH_IDX.get(ch_name)
+        if idx is None:
+            continue
+        try:
+            rank = cands.index(track_id)   # 0-based
+            feat[idx * 2]     = 1.0
+            feat[idx * 2 + 1] = 1.0 - rank / max(len(cands), topk_per_channel)
+        except ValueError:
+            pass   # not in this channel
+    return feat
