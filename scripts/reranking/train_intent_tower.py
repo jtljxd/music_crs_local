@@ -277,6 +277,9 @@ def train(args: argparse.Namespace) -> None:
 
     query_store = _lpt(args.query_emb_path)
     goal_store  = _lpt(args.goal_emb_path)
+    # Val query emb: use separate path if provided, else reuse train store
+    val_query_store = _lpt(args.val_query_emb_path) if args.val_query_emb_path else query_store
+    val_goal_store  = _lpt(args.val_goal_emb_path)  if args.val_goal_emb_path  else goal_store
 
     # ── Load track metadata for bucket features ───────────────────────────────
     logger.info("Loading track metadata …")
@@ -321,7 +324,16 @@ def train(args: argparse.Namespace) -> None:
         return out
 
     train_samples = _filter(train_samples)
-    val_samples   = _filter(val_samples)
+    # For val, use val_query_store (may differ from train)
+    def _filter_val(samples):
+        out = []
+        for s in samples:
+            if s["gt_track_id"] in valid_tracks:
+                qk = f"{s['session_id']}_{s['turn_number']}_query"
+                if val_query_store.get(qk) is not None or val_query_store.get(f"{s['session_id']}_{s['turn_number']}") is not None:
+                    out.append(s)
+        return out
+    val_samples = _filter_val(val_samples)
     logger.info("Filtered → train=%d, val=%d", len(train_samples), len(val_samples))
 
     # ── DataLoaders ────────────────────────────────────────────────────────────
@@ -332,7 +344,13 @@ def train(args: argparse.Namespace) -> None:
                           num_workers=args.num_workers, pin_memory=True)
 
     train_loader = _make_loader(train_samples, shuffle=True)
-    val_loader   = _make_loader(val_samples,   shuffle=False)
+    # Val loader uses val-specific embedding stores
+    def _make_val_loader(samples):
+        ds = IntentTowerDataset(samples, index, val_query_store, val_goal_store,
+                                track_meta, user_meta, num_neg=args.num_neg)
+        return DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=True)
+    val_loader = _make_val_loader(val_samples)
 
     # ── Model, optimiser ──────────────────────────────────────────────────────
     model = IntentTower(dropout=args.dropout).to(device)
@@ -395,19 +413,50 @@ def train(args: argparse.Namespace) -> None:
                 val_losses.append(out["loss"].item())
 
         tr_l = sum(train_losses) / len(train_losses)
-        vl_l = sum(val_losses)   / len(val_losses)
-        logger.info("Epoch %d/%d  train_loss=%.4f  val_loss=%.4f",
-                    epoch, args.epochs, tr_l, vl_l)
-        history.append({"epoch": epoch, "train_loss": tr_l, "val_loss": vl_l})
 
-        if vl_l < best_val_loss:
-            best_val_loss = vl_l
-            patience_cnt  = 0
-            model.save(args.out)
-            logger.info("  ✅ Saved best model → %s", args.out)
+        # Validation (skip if val set is empty)
+        if len(val_samples) > 0:
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    out   = model(
+                        batch["query_emb"], batch["goal_emb"], batch["category_emb"],
+                        batch["spec_emb"],  batch["date_emb"], batch["profile_emb"],
+                        batch["t_meta"],    batch["t_lyrics"],  batch["t_attr"],
+                        batch["t_audio"],   batch["t_image"],   batch["t_cf"],
+                        batch["t_pop"],     batch["t_year"],    batch["t_dur"],
+                        neg_meta=batch["n_meta"],   neg_lyrics=batch["n_lyrics"],
+                        neg_attr=batch["n_attr"],   neg_audio=batch["n_audio"],
+                        neg_image=batch["n_image"], neg_cf=batch["n_cf"],
+                        neg_pop=batch["n_pop"],     neg_year=batch["n_year"],
+                        neg_dur=batch["n_dur"],
+                    )
+                    val_losses.append(out["loss"].item())
+            vl_l = sum(val_losses) / len(val_losses)
+            logger.info("Epoch %d/%d  train_loss=%.4f  val_loss=%.4f",
+                        epoch, args.epochs, tr_l, vl_l)
+            history.append({"epoch": epoch, "train_loss": tr_l, "val_loss": vl_l})
+            if vl_l < best_val_loss:
+                best_val_loss = vl_l
+                patience_cnt  = 0
+                model.save(args.out)
+                logger.info("  ✅ Saved best model → %s", args.out)
+            else:
+                patience_cnt += 1
+                logger.info("  patience %d/%d", patience_cnt, args.patience)
+                if patience_cnt >= args.patience:
+                    logger.info("Early stopping at epoch %d.", epoch)
+                    break
         else:
-            patience_cnt += 1
-            logger.info("  patience %d/%d", patience_cnt, args.patience)
+            # No validation set — save every epoch
+            vl_l = float("nan")
+            logger.info("Epoch %d/%d  train_loss=%.4f  (no val set, saving checkpoint)",
+                        epoch, args.epochs, tr_l)
+            history.append({"epoch": epoch, "train_loss": tr_l, "val_loss": vl_l})
+            model.save(args.out)
+            logger.info("  ✅ Saved → %s", args.out)
             if patience_cnt >= args.patience:
                 logger.info("Early stopping at epoch %d.", epoch)
                 break
@@ -442,6 +491,10 @@ def parse_args():
     p.add_argument("--num_workers",     type=int,   default=4)
     p.add_argument("--num_neg",          type=int,   default=15,
                    help="Number of random negatives per training sample")
+    p.add_argument("--val_query_emb_path", type=str, default=None,
+                   help="Query emb path for val set (default: reuse train query emb path)")
+    p.add_argument("--val_goal_emb_path",  type=str, default=None,
+                   help="Goal emb path for val set (default: reuse train goal emb path)")
     p.add_argument("--device",          type=str,   default="cuda")
     return p.parse_args()
 
