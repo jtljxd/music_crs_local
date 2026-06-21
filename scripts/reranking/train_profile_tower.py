@@ -284,11 +284,18 @@ def train(args: argparse.Namespace) -> None:
                 val_losses.append(out["loss"].item())
 
         tr_l = sum(train_losses) / len(train_losses)
-        vl_l = sum(val_losses)   / len(val_losses)
+        vl_l = sum(val_losses) / len(val_losses) if val_losses else float("nan")
         logger.info("Epoch %d/%d  train=%.4f  val=%.4f", epoch, args.epochs, tr_l, vl_l)
         history.append({"epoch": epoch, "train_loss": tr_l, "val_loss": vl_l})
 
-        if vl_l < best_val_loss:
+        if not val_losses:
+            # No validation data — save every epoch
+            torch.save({
+                "model_state":    model.state_dict(),
+                "tag_proj_state": tag_proj.state_dict(),
+            }, args.out)
+            logger.info("  ✅ Saved (no val) → %s", args.out)
+        elif vl_l < best_val_loss:
             best_val_loss = vl_l
             patience_cnt  = 0
             torch.save({
