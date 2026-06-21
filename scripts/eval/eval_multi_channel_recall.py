@@ -142,12 +142,12 @@ def evaluate(args: argparse.Namespace) -> None:
 
         # --non_last_only: skip the last music turn in each session
         # (mirrors blind-A evaluation convention where the last turn is the target)
-        if args.non_last_only and len(music_turns) > 1:
+        # Single-turn sessions are skipped entirely (no non-last turn to evaluate)
+        if args.non_last_only:
+            if len(music_turns) <= 1:
+                continue
             last_music_turn = max(music_turns.keys())
             music_turns = {t: tid for t, tid in music_turns.items() if t != last_music_turn}
-        elif args.non_last_only and len(music_turns) == 1:
-            # Only one music turn — skip entire session
-            continue
 
         for turn_number, gt_track_id in music_turns.items():
             total_turns += 1
