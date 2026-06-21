@@ -171,11 +171,15 @@ def ch07_goal_attributes(ctx: RetrievalContext, store: IndexStore, k: int = 25) 
 
 
 def ch08_session_pos_feedback(ctx: RetrievalContext, store: IndexStore, k: int = 35) -> List[str]:
-    """CH08 — Session positive-feedback tracks mean-vec × metadata cosine topK."""
+    """CH08 — Session positive-feedback tracks mean-vec × attributes cosine topK.
+
+    Uses attributes modality to capture genre/mood/style preferences from
+    pos-history tracks, complementing CH17 (which uses metadata).
+    """
     if not ctx.pos_track_ids:
         return []
-    mean_v = _mean_vec(store, "metadata", ctx.pos_track_ids)
-    return _safe_topk(store, "metadata", mean_v, k)
+    mean_v = _mean_vec(store, "attributes", ctx.pos_track_ids)
+    return _safe_topk(store, "attributes", mean_v, k)
 
 
 def ch09_session_neg_correction(ctx: RetrievalContext, store: IndexStore, k: int = 25) -> List[str]:
