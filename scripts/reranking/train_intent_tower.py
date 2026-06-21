@@ -141,12 +141,13 @@ class IntentTowerDataset(Dataset):
 
         # ── Track side ────────────────────────────────────────────────────────
         def _get_track_vecs(track_id: str):
-            meta_emb  = self.index.get_vec("metadata",   track_id) or torch.zeros(1024)
-            lyr_emb   = self.index.get_vec("lyrics",     track_id) or torch.zeros(1024)
-            attr_emb  = self.index.get_vec("attributes", track_id) or torch.zeros(1024)
-            audio_emb = self.index.get_vec("audio",      track_id) or torch.zeros(512)
-            image_emb = self.index.get_vec("image",      track_id) or torch.zeros(1152)
-            cf_emb    = self.index.get_vec("cf_bpr",     track_id) or torch.zeros(128)
+            def _gv(mod, dim): v = self.index.get_vec(mod, track_id); return v if v is not None else torch.zeros(dim)
+            meta_emb  = _gv("metadata",   1024)
+            lyr_emb   = _gv("lyrics",     1024)
+            attr_emb  = _gv("attributes", 1024)
+            audio_emb = _gv("audio",       512)
+            image_emb = _gv("image",      1152)
+            cf_emb    = _gv("cf_bpr",      128)
             tm = self.track_meta.get(track_id, {})
             pop_b  = _bucket_emb(tm.get("popularity"),     8,   0, 100)
             year_b = _bucket_emb(tm.get("release_year"),   8, 1950, 2030)
