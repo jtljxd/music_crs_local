@@ -60,6 +60,7 @@ _DEFAULT_DIMS: Dict[str, int] = {
     "audio":      512,
     "image":      1152,
     "tag_bge":    384,
+    "bge_rich":   384,
 }
 
 
@@ -169,6 +170,7 @@ class IndexStore:
         split_types:        List[str] = None,
         cache_dir:          str  = "qwen/retrieval_indices",
         bge_tag_path:       Optional[str] = "bge/track_tag_embeddings.pt",
+        bge_rich_path:      Optional[str] = "bge/track_rich_embeddings.pt",
         device:             str  = "cpu",
         force_rebuild:      bool = False,
     ) -> "IndexStore":
@@ -198,6 +200,14 @@ class IndexStore:
                 logger.info("Appending tag_bge from %s …", bge_tag_path)
                 matrices["tag_bge"] = cls._load_bge_tag_matrix(
                     bge_tag_path, track_ids
+                )
+                torch.save(matrices, matrices_path)
+            # Optionally add BGE rich track matrix if not yet in cache
+            if (bge_rich_path and os.path.exists(bge_rich_path)
+                    and "bge_rich" not in matrices):
+                logger.info("Appending bge_rich from %s …", bge_rich_path)
+                matrices["bge_rich"] = cls._load_bge_tag_matrix(
+                    bge_rich_path, track_ids
                 )
                 torch.save(matrices, matrices_path)
 
@@ -264,6 +274,11 @@ class IndexStore:
         if bge_tag_path and os.path.exists(bge_tag_path):
             matrices["tag_bge"] = cls._load_bge_tag_matrix(bge_tag_path, track_ids)
             logger.info("  %-12s  shape=%s", "tag_bge", matrices["tag_bge"].shape)
+
+        # Add BGE rich track matrix
+        if bge_rich_path and os.path.exists(bge_rich_path):
+            matrices["bge_rich"] = cls._load_bge_tag_matrix(bge_rich_path, track_ids)
+            logger.info("  %-12s  shape=%s", "bge_rich", matrices["bge_rich"].shape)
 
         # Save
         with open(ids_path, "w") as f:

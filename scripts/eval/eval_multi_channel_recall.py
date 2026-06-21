@@ -95,9 +95,11 @@ def evaluate(args: argparse.Namespace) -> None:
         split_types         = ["all_tracks"],
         cache_dir           = args.cache_dir,
         bge_tag_path        = args.bge_tag_path,
+        bge_rich_path       = args.bge_rich_path,
         goal_emb_path       = args.goal_emb_path,
         query_emb_path      = args.query_emb_path,
-        genre_emb_path      = args.genre_emb_path,
+        # genre_emb_path doubles as turn_query BGE emb path (--turn_query_emb_path overrides)
+        genre_emb_path      = args.turn_query_emb_path or args.genre_emb_path,
         decade_emb_path     = args.decade_emb_path,
         device              = args.device,
     )
@@ -287,7 +289,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal_emb_path",   type=str, default=None,
                    help="Path to qwen/goal_embeddings_{split}_0.6b.pt")
     p.add_argument("--genre_emb_path",  type=str, default=None,
-                   help="Path to bge/query_genre_embeddings_{split}.pt")
+                   help="Path to bge/query_genre_embeddings_{split}.pt (legacy)")
+    p.add_argument("--turn_query_emb_path", type=str, default=None,
+                   help="Path to bge/turn_query_embeddings_{split}.pt (new CH22 query emb; overrides genre_emb_path for CH22)")
+    p.add_argument("--bge_rich_path", type=str,
+                   default="bge/track_rich_embeddings.pt",
+                   help="Path to bge/track_rich_embeddings.pt (track-side BGE rich index for CH22)")
     p.add_argument("--decade_emb_path", type=str, default=None,
                    help="Path to bge/query_decade_embeddings_{split}.pt")
     p.add_argument("--topk", type=int, default=200)

@@ -323,6 +323,166 @@ def run_track_mode(args, tokenizer, model, device: str):
     logger.info("Done. %d total track-tag entries → %s", len(store), out_path)
 
 
+# ── MODE C: per-turn user query embeddings (direct from conversation) ──────────
+
+def run_turn_query_mode(args, tokenizer, model, device: str):
+    """Encode each user turn's text directly from the conversation dataset.
+
+    Output file: {out_dir}/turn_query_embeddings_{split_name}.pt
+    Key format : {session_id}_{turn_number}   (same fallback key as dialogue_embeddings)
+    Value      : Tensor[384] fp16
+    """
+    from datasets import load_dataset as _load_ds
+    out_path = os.path.join(args.out_dir, f"turn_query_embeddings_{args.split_name}.pt")
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Resume
+    store: Dict[str, torch.Tensor] = {}
+    if os.path.exists(out_path):
+        logger.info("Resuming from %s …", out_path)
+        store = torch.load(out_path, map_location="cpu", weights_only=True)
+        logger.info("  %d entries already cached.", len(store))
+
+    logger.info("Loading conversation dataset %s (split=%s) …", args.conv_dataset, args.split_name)
+    ds = _load_ds(args.conv_dataset, split=args.split_name)
+    logger.info("  %d sessions.", len(ds))
+
+    # Collect all user turns that haven't been encoded yet
+    keys:  List[str] = []
+    texts: List[str] = []
+    for item in ds:
+        session_id = str(item.get("session_id") or item.get("id") or "")
+        convs = item.get("conversations", [])
+        for c in convs:
+            if c.get("role") not in ("user", "human"):
+                continue
+            turn = str(c.get("turn_number", ""))
+            key  = f"{session_id}_{turn}"
+            if key in store:
+                continue
+            text = str(c.get("content") or "").strip()
+            keys.append(key)
+            texts.append(text)
+
+    logger.info("%d user turns to encode.", len(keys))
+    if not keys:
+        logger.info("Nothing to do.")
+        return
+
+    empty_idx = [i for i, t in enumerate(texts) if not t]
+    non_empty = [(keys[i], texts[i]) for i in range(len(keys)) if texts[i]]
+
+    for i in empty_idx:
+        store[keys[i]] = torch.zeros(TARGET_DIM, dtype=torch.float16)
+
+    if non_empty:
+        ne_keys, ne_texts = zip(*non_empty)
+        pbar = tqdm(range(0, len(ne_texts), args.batch), desc="Encoding turns", unit="batch")
+        for start in pbar:
+            bk = ne_keys [start : start + args.batch]
+            bt = ne_texts[start : start + args.batch]
+            embs = encode_texts(list(bt), tokenizer, model, device, args.batch, add_prefix=True)
+            for j, k in enumerate(bk):
+                store[k] = embs[j]
+            pbar.set_postfix(total=len(store))
+            if ((start // args.batch) + 1) % args.save_every == 0:
+                torch.save(store, out_path)
+
+    torch.save(store, out_path)
+    logger.info("Done. %d turn embeddings → %s", len(store), out_path)
+
+
+# ── MODE D: track rich-info embeddings ─────────────────────────────────────────
+
+# Fields to concatenate for each track's rich text representation
+_TRACK_RICH_FIELDS = [
+    ("track_name",   True),   # (field_name, is_list)
+    ("artist_name",  True),
+    ("album_name",   True),
+    ("tag_list",     True),
+    ("release_date", False),
+    ("duration",     False),
+    ("popularity",   False),
+]
+
+def _build_track_rich_text(item: dict) -> str:
+    """Concatenate multiple track metadata fields into a single text string."""
+    parts: List[str] = []
+    for field, is_list in _TRACK_RICH_FIELDS:
+        val = item.get(field)
+        if val is None:
+            continue
+        if is_list and isinstance(val, list):
+            text = ", ".join(str(v) for v in val if v is not None)
+        else:
+            text = str(val).strip()
+        if text:
+            parts.append(text)
+    return " | ".join(parts)
+
+
+def run_track_rich_mode(args, tokenizer, model, device: str):
+    """Encode rich track info (name + artist + album + tags + date + duration + popularity).
+
+    Output file: {out_dir}/track_rich_embeddings.pt
+    Key format : track_id (str)
+    Value      : Tensor[384] fp16
+    """
+    from datasets import load_dataset as _load_ds
+    out_path = os.path.join(args.out_dir, "track_rich_embeddings.pt")
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Resume
+    store: Dict[str, torch.Tensor] = {}
+    if os.path.exists(out_path):
+        logger.info("Resuming from %s …", out_path)
+        store = torch.load(out_path, map_location="cpu", weights_only=True)
+        logger.info("  %d entries already cached.", len(store))
+
+    logger.info("Loading track metadata from %s …", args.track_dataset)
+    ds = _load_ds(args.track_dataset, split=args.track_split)
+    logger.info("  %d tracks.", len(ds))
+
+    # Collect pending
+    keys:  List[str] = []
+    texts: List[str] = []
+    for idx in tqdm(range(len(ds)), desc="Scanning tracks", unit="track"):
+        item     = ds[idx]
+        track_id = str(item["track_id"])
+        if track_id in store:
+            continue
+        rich_text = _build_track_rich_text(item)
+        keys.append(track_id)
+        texts.append(rich_text)
+
+    logger.info("%d tracks to encode.", len(keys))
+    if not keys:
+        logger.info("Nothing to do.")
+        return
+
+    empty_idx = [i for i, t in enumerate(texts) if not t.strip()]
+    non_empty = [(keys[i], texts[i]) for i in range(len(keys)) if texts[i].strip()]
+
+    for i in empty_idx:
+        store[keys[i]] = torch.zeros(TARGET_DIM, dtype=torch.float16)
+
+    if non_empty:
+        ne_keys, ne_texts = zip(*non_empty)
+        pbar = tqdm(range(0, len(ne_texts), args.batch), desc="Encoding track rich", unit="batch")
+        for start in pbar:
+            bk = ne_keys [start : start + args.batch]
+            bt = ne_texts[start : start + args.batch]
+            embs = encode_texts(list(bt), tokenizer, model, device, args.batch, add_prefix=False)
+            for j, k in enumerate(bk):
+                store[k] = embs[j]
+            pbar.set_postfix(total=len(store))
+            if ((start // args.batch) + 1) % args.save_every == 0:
+                torch.save(store, out_path)
+
+    torch.save(store, out_path)
+    logger.info("Done. %d track-rich entries → %s", len(store), out_path)
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(args):
@@ -337,8 +497,12 @@ def main(args):
         run_query_mode(args, tokenizer, model, device)
     elif args.mode == "track":
         run_track_mode(args, tokenizer, model, device)
+    elif args.mode == "turn_query":
+        run_turn_query_mode(args, tokenizer, model, device)
+    elif args.mode == "track_rich":
+        run_track_rich_mode(args, tokenizer, model, device)
     else:
-        raise ValueError(f"Unknown mode: {args.mode}. Use 'query' or 'track'.")
+        raise ValueError(f"Unknown mode: {args.mode}.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -346,15 +510,17 @@ def main(args):
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
-            "Pre-compute BGE-Small-EN-v1.5 embeddings for "
-            "query genre/decade fields and track tag_list."
+            "Pre-compute BGE-Small-EN-v1.5 embeddings.\n"
+            "Modes:\n"
+            "  query      : encode genre/decade from query_split store\n"
+            "  track      : encode tag_list from track metadata\n"
+            "  turn_query : encode each user turn directly from conversation dataset\n"
+            "  track_rich : encode rich track info (name+artist+album+tags+date+duration+popularity)\n"
         )
     )
     p.add_argument(
         "--mode", type=str, required=True,
-        choices=["query", "track"],
-        help="'query': encode genre/decade from query_split store; "
-             "'track': encode tag_list from track metadata.",
+        choices=["query", "track", "turn_query", "track_rich"],
     )
 
     # ── query mode args ──
@@ -369,8 +535,17 @@ def parse_args():
         help="Split label used in output filename (train / test / blindA)",
     )
 
-    # ── track mode args ──
-    t = p.add_argument_group("Track mode (--mode track)")
+    # ── turn_query mode args ──
+    tq = p.add_argument_group("Turn-query mode (--mode turn_query)")
+    tq.add_argument(
+        "--conv_dataset", type=str,
+        default="talkpl-ai/TalkPlayData-Challenge-Dataset",
+        help="HuggingFace conversation dataset for turn_query mode",
+    )
+    # split_name is shared with query mode (already defined above)
+
+    # ── track / track_rich mode args ──
+    t = p.add_argument_group("Track mode (--mode track or track_rich)")
     t.add_argument(
         "--track_dataset", type=str,
         default="talkpl-ai/TalkPlayData-Challenge-Track-Metadata",
@@ -391,10 +566,8 @@ def parse_args():
         "--out_dir", type=str, default="bge",
         help="Directory to write output .pt files",
     )
-    p.add_argument("--batch",      type=int, default=256,
-                   help="Encoding batch size (BGE is small, can use large batches)")
-    p.add_argument("--save_every", type=int, default=50,
-                   help="Save checkpoint every N batches")
+    p.add_argument("--batch",      type=int, default=256)
+    p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--device",     type=str, default="auto")
     return p.parse_args()
 

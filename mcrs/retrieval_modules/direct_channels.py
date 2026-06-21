@@ -171,15 +171,29 @@ def ch07_goal_attributes(ctx: RetrievalContext, store: IndexStore, k: int = 25) 
 
 
 def ch08_session_pos_feedback(ctx: RetrievalContext, store: IndexStore, k: int = 35) -> List[str]:
-    """CH08 — Session positive-feedback tracks mean-vec × attributes cosine topK.
+    """CH08 — Pos-feedback steered query recall on metadata.
 
-    Uses attributes modality to capture genre/mood/style preferences from
-    pos-history tracks, complementing CH17 (which uses metadata).
+    Steers the current query (or goal) vector toward the positive-history
+    centroid: steered = normalize(intent + λ * pos_mean), then retrieves
+    on metadata. Complements CH17 (pure pos mean) by injecting current intent.
+    λ = 0.5 (equal weight between intent and pos history).
     """
     if not ctx.pos_track_ids:
         return []
-    mean_v = _mean_vec(store, "attributes", ctx.pos_track_ids)
-    return _safe_topk(store, "attributes", mean_v, k)
+    intent_vec = ctx.query_emb if ctx.query_emb is not None else ctx.goal_emb
+    if intent_vec is None:
+        # Fall back to pure pos-mean on audio (distinct from CH17/CH19)
+        mean_v = _mean_vec(store, "audio", ctx.pos_track_ids)
+        return _safe_topk(store, "audio", mean_v, k)
+    pos_mean = _mean_vec(store, "metadata", ctx.pos_track_ids)
+    if pos_mean is None:
+        return _safe_topk(store, "metadata", intent_vec, k)
+    lam = 0.5
+    steered = F.normalize(
+        (intent_vec.float() + lam * pos_mean.float()).unsqueeze(0),
+        p=2, dim=1
+    ).squeeze(0)
+    return _safe_topk(store, "metadata", steered, k)
 
 
 def ch09_session_neg_correction(ctx: RetrievalContext, store: IndexStore, k: int = 25) -> List[str]:
@@ -316,27 +330,29 @@ def ch21_album_expand(ctx: RetrievalContext, store: IndexStore, k: int = 10) -> 
 
 
 def ch22_bge_genre_decade(ctx: RetrievalContext, store: IndexStore, k: int = 25) -> List[str]:
-    """CH22 — BGE genre + decade embedding recall on track tag_list."""
-    if not store.has_modality("tag_bge"):
+    """CH22 — BGE turn-query embedding recall on track rich-info (bge_rich).
+
+    The query embedding is the BGE encoding of the current user turn text
+    (from turn_query_embeddings_{split}.pt, key={session_id}_{turn}).
+    The track index uses bge_rich: BGE encoding of
+    track_name + artist_name + album_name + tag_list + release_date + duration + popularity.
+
+    Falls back to tag_bge if bge_rich is not available.
+    """
+    # Prefer bge_rich; fall back to tag_bge for backward compatibility
+    modality = "bge_rich" if store.has_modality("bge_rich") else (
+               "tag_bge"  if store.has_modality("tag_bge")  else None)
+    if modality is None:
         return []
-    results: List[str] = []
-    seen:    set       = set()
 
-    half_k = k // 2
+    # Use turn-level BGE query emb (genre_emb stores the turn_query emb in new setup)
+    # genre_emb / decade_emb may still hold old genre/decade vecs if old pipeline used
+    query_emb = ctx.genre_emb  # repurposed as turn_query_emb in new pipeline
 
-    if ctx.genre_emb is not None and ctx.genre_emb.abs().sum().item() > 0:
-        genre_hits = store.topk("tag_bge", ctx.genre_emb, half_k)
-        for tid in genre_hits:
-            if tid not in seen:
-                results.append(tid)
-                seen.add(tid)
+    if query_emb is None or query_emb.abs().sum().item() == 0:
+        return []
 
-    if ctx.decade_emb is not None and ctx.decade_emb.abs().sum().item() > 0:
-        decade_hits = store.topk("tag_bge", ctx.decade_emb, k - len(results))
-        for tid in decade_hits:
-            if tid not in seen:
-                results.append(tid)
-                seen.add(tid)
+    return store.topk(modality, query_emb, k)
 
     return results[:k]
 

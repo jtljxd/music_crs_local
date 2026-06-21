@@ -70,8 +70,9 @@ class MultiChannelConfig:
     bge_tag_path:         Optional[str]    = "bge/track_tag_embeddings.pt"
     goal_emb_path:        Optional[str]    = None
     query_emb_path:       Optional[str]    = None
-    genre_emb_path:       Optional[str]    = None
+    genre_emb_path:       Optional[str]    = None  # legacy: old genre emb; or new turn_query BGE emb path
     decade_emb_path:      Optional[str]    = None
+    bge_rich_path:        Optional[str]    = "bge/track_rich_embeddings.pt"
     device:               str              = "cpu"
     topk_per_channel:     Dict[str, int]   = field(default_factory=dict)
     cf_quota_redistrib:   bool             = True
@@ -137,6 +138,7 @@ class MultiChannelRetrievalV2:
             split_types=cfg.split_types,
             cache_dir=cfg.cache_dir,
             bge_tag_path=cfg.bge_tag_path,
+            bge_rich_path=cfg.bge_rich_path,
             device=cfg.device,
         )
 
@@ -460,16 +462,59 @@ class MultiChannelRetrievalV2:
                 logger.warning("CF tower channel failed: %s", e)
                 results["CH_CF_Tower"] = []
 
-        # ── Merge (de-duplicate, first-appearance order) ──────────────────────
-        merged: List[str] = []
-        seen: set = set()
+        # ── Merge via Reciprocal Rank Fusion (RRF) ────────────────────────────
+        # score(d) = Σ_channel  weight[channel] / (RRF_K + rank[channel])
+        # Channels absent or empty get no contribution.
+        # CF-BPR weight is zeroed out when user has no CF embedding.
+        RRF_K = 60  # standard RRF constant
+
+        # ── Per-channel weights ────────────────────────────────────────────────
+        _W: Dict[str, float] = {
+            # Query / Goal text recall — high
+            "CH02_Query_Meta":       3.0,
+            "CH03_Query_Lyrics":     3.0,
+            "CH04_Query_Attributes": 3.0,
+            "CH05_Goal_Meta":        3.0,
+            "CH06_Goal_Lyrics":      3.0,
+            "CH07_Goal_Attributes":  3.0,
+            "CH23_BM25":             3.0,
+            # Session pos/neg feedback — high
+            "CH08_Pos_Sem":          3.0,
+            "CH09_Neg_Correct":      3.0,
+            "CH10_Query_Delta":      2.5,
+            # Artist / Album / Tag expansion — high (coverage-limited)
+            "CH20_Artist_Expand":    3.0,
+            "CH21_Album_Expand":     3.0,
+            "CH22_BGE_Genre_Decade": 2.5,
+            # CF-BPR — mid-high if user has CF, else 0
+            "CH01_CF_BPR":           3.0 if ctx.has_user_cf else 0.0,
+            # Last-track similarity — medium
+            "CH11_Last_Audio":       2.0,
+            "CH12_Last_Image":       2.0,
+            "CH13_Last_Meta":        2.0,
+            "CH14_Last_Lyrics":      2.0,
+            # Pos-history audio/image — medium-low, only meaningful with history
+            "CH15_Pos_Audio":        1.5,
+            "CH16_Pos_Image":        1.5,
+            "CH17_Pos_Meta":         2.0,
+            "CH18_Pos_Lyrics":       1.5,
+            "CH19_Pos_Attributes":   1.5,
+            # Trained model towers — high when available
+            "CH_Intent":             3.5,
+            "CH_Profile":            2.5,
+            "CH_CF_Tower":           3.0 if ctx.has_user_cf else 0.0,
+        }
+
+        rrf_scores: Dict[str, float] = {}
         for ch_name, candidates in results.items():
-            for tid in candidates:
-                if tid not in seen:
-                    merged.append(tid)
-                    seen.add(tid)
-        # Keep ALL union candidates; callers (eval script) slice at their own K
-        results["merged"] = merged
+            w = _W.get(ch_name, 1.0)
+            if w == 0.0 or not candidates:
+                continue
+            for rank_0, tid in enumerate(candidates):  # rank_0 is 0-indexed
+                rrf_scores[tid] = rrf_scores.get(tid, 0.0) + w / (RRF_K + rank_0 + 1)
+
+        # Sort by RRF score descending; keep ALL candidates (caller slices at K)
+        results["merged"] = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
 
         logger.debug(
             "Session %s turn %d: %d channels, %d merged candidates",
