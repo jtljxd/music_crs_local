@@ -260,7 +260,13 @@ def run(args: argparse.Namespace) -> None:
             [int(c["turn_number"]) for c in convs if c.get("role") == "user"]
         )
         if not user_turns:
-            results.append({"session_id": session_id, "top_music_ids": fallback_tids})
+            results.append({
+                "session_id":          session_id,
+                "user_id":             user_id,
+                "turn_number":         1,
+                "predicted_track_ids": fallback_tids,
+                "predicted_response":  "",
+            })
             continue
         target_turn = user_turns[-1]
 
@@ -335,7 +341,13 @@ def run(args: argparse.Namespace) -> None:
         scored.sort(key=lambda x: x[0], reverse=True)
         top_ids = [tid for _, tid in scored[: args.topk]]
 
-        results.append({"session_id": session_id, "top_music_ids": top_ids})
+        results.append({
+            "session_id":          session_id,
+            "user_id":             user_id,
+            "turn_number":         target_turn,
+            "predicted_track_ids": top_ids,
+            "predicted_response":  "",
+        })
 
     # ── Save ──────────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
